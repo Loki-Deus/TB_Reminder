@@ -17,3 +17,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+-e 
+# Player reminder stats (persistent data, kept on server)
+stats.json
