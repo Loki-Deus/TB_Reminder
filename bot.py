@@ -416,9 +416,17 @@ async def on_ready():
     print(f"   rolle       : {MEMBER_ROLE_ID}")
 
 
-@tree.command(name="start", description="Startet die TB-Phasen-Ankündigungen")
-@app_commands.checks.has_permissions(administrator=True)
+@tree.command(name="start_tb_bot", description="Startet die TB-Phasen-Ankündigungen")
 async def start(interaction: discord.Interaction):
+    is_admin = interaction.user.guild_permissions.administrator
+    is_officer = interaction.user.id == OFFICER_ID
+
+    if not is_admin and not is_officer:
+        await interaction.response.send_message(
+            "❌ Du benötigst Administrator-Rechte oder Officer-Status für diesen Befehl.",
+            ephemeral=True,
+        )
+        return
     global is_running
 
     if is_running:
@@ -443,15 +451,6 @@ async def start(interaction: discord.Interaction):
 
     is_running = True
     asyncio.create_task(run_sequence(channel))
-
-
-@start.error
-async def start_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ Du benötigst Administrator-Rechte für diesen Befehl.",
-            ephemeral=True,
-        )
 
 
 bot.run(TOKEN)
