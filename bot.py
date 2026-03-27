@@ -409,7 +409,9 @@ async def run_sequence(tw_channel: discord.TextChannel):
 
 @bot.event
 async def on_ready():
-    await tree.sync()
+    guild = discord.Object(id=1269591429227745332)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
     print(f"   tw_channel  : {TW_CHANNEL_ID}")
     print(f"   officer     : {OFFICER_ID}")
