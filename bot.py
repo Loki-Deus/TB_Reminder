@@ -410,6 +410,10 @@ async def run_sequence(tw_channel: discord.TextChannel):
 @bot.event
 async def on_ready():
     guild = discord.Object(id=1269591429227745332)
+    # Clear any old global commands
+    tree.clear_commands(guild=None)
+    await tree.sync()
+    # Register guild commands instantly
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
