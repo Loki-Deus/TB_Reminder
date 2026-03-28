@@ -410,15 +410,16 @@ async def run_sequence(tw_channel: discord.TextChannel):
 @bot.event
 async def on_ready():
     guild = discord.Object(id=1269591429227745332)
-    tree.clear_commands(guild=guild)      # clear OLD guild commands
-    await tree.sync(guild=guild)          # push the wipe
-    tree.copy_global_to(guild=guild)      # copy current local commands to guild
-    await tree.sync(guild=guild)          # push the new ones
+    tree.clear_commands(guild=guild)      # clear guild commands
+    tree.clear_commands(guild=None)       # clear global commands
+    await tree.sync(guild=guild)          # push guild wipe
+    await tree.sync()                     # push global wipe
+    tree.copy_global_to(guild=guild)      # copy current commands to guild
+    await tree.sync(guild=guild)          # register them
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
     print(f"   tw_channel  : {TW_CHANNEL_ID}")
     print(f"   officer     : {OFFICER_ID}")
     print(f"   rolle       : {MEMBER_ROLE_ID}")
-
 
 @tree.command(name="start_tb_bot", description="Startet die TB-Phasen-Ankündigungen")
 async def start(interaction: discord.Interaction):
