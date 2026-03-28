@@ -4,15 +4,14 @@ services:
     container_name: tb-reminder
     restart: unless-stopped
 
-    # Feed secrets from .env file — never baked into the image
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - TW_CHANNEL_ID=${TW_CHANNEL_ID}
       - OFFICER_ID=${OFFICER_ID}
       - MEMBER_ROLE_ID=${MEMBER_ROLE_ID}
+      - MANAGER_IDS=${MANAGER_IDS}
       - DATA_DIR=/app/data
 
-    # Persist stats.json across container restarts and rebuilds
     volumes:
       - tb-stats:/app/data
 
