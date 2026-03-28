@@ -409,14 +409,13 @@ async def run_sequence(tw_channel: discord.TextChannel):
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 @bot.event
+@bot.event
 async def on_ready():
     guild = discord.Object(id=1269591429227745332)
-    tree.clear_commands(guild=guild)      # clear guild commands
-    tree.clear_commands(guild=None)       # clear global commands
-    await tree.sync(guild=guild)          # push guild wipe
-    await tree.sync()                     # push global wipe
-    tree.copy_global_to(guild=guild)      # copy current commands to guild
-    await tree.sync(guild=guild)          # register them
+    tree.clear_commands(guild=guild)
+    await tree.sync(guild=guild)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
     print(f"   tw_channel  : {TW_CHANNEL_ID}")
     print(f"   officer     : {OFFICER_ID}")
