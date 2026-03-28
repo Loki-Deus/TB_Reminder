@@ -11,6 +11,7 @@ load_dotenv()
 TOKEN          = os.getenv("DISCORD_TOKEN")
 TW_CHANNEL_ID  = int(os.getenv("TW_CHANNEL_ID"))
 OFFICER_ID     = int(os.getenv("OFFICER_ID"))
+MANAGER_IDS    = set(int(i) for i in os.getenv("MANAGER_IDS", "").split(",") if i.strip())
 MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID"))
 
 HOURS = 3600
@@ -424,7 +425,7 @@ async def on_ready():
 @tree.command(name="start_tb_bot", description="Startet die TB-Phasen-Ankündigungen")
 async def start(interaction: discord.Interaction):
     is_admin = interaction.user.guild_permissions.administrator
-    is_officer = interaction.user.id == OFFICER_ID
+    is_officer = interaction.user.id in MANAGER_IDS
 
     if not is_admin and not is_officer:
         await interaction.response.send_message(
