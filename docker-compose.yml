@@ -2,6 +2,9 @@ version: "3.8"
 
 services:
   tb-reminder:
+    build:
+      context: https://github.com/Loki-Deus/TB_Reminder.git
+      dockerfile: Dockerfile
     image: tb-reminder:latest
     container_name: tb-reminder
     restart: unless-stopped
