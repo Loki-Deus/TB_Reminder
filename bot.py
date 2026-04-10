@@ -417,13 +417,14 @@ async def handle_phase_end(
     reminder_view = PlayerSelectView(members)
 
     try:
-        await officer.send(
+        msg = await officer.send(
             f"**Phase {phase_num} endet bald! (Territory Battle)**\n"
             f"Waehle die Spieler aus, die eine persoenliche Erinnerung erhalten sollen.\n"
             f"Du hast **1 Stunde** Zeit. Danach wird automatisch eine generische Nachricht gesendet.\n\n"
             f"*(Spieler in den Dropdowns auswaehlen, dann auf Bestaetigen klicken)*",
             view=reminder_view,
         )
+        reminder_view.message = msg
     except discord.Forbidden:
         print("Officer hat DMs deaktiviert - generische Nachricht wird gesendet")
         await send_generic()
@@ -473,13 +474,14 @@ async def handle_phase_end(
         deadline_ts = int(time.time()) + int(failed_timeout)
         failed_view = FailedSetView(members, timeout=failed_timeout)
         try:
-            await officer.send(
+            msg = await officer.send(
                 f"**Phase {phase_num} - Wer hat NICHT stationiert?**\n"
                 f"Waehle die Spieler aus, die diese Phase nicht stationiert haben.\n"
                 f"Du hast Zeit bis <t:{deadline_ts}:F> (<t:{deadline_ts}:R>).\n\n"
                 f"*(Falls alle stationiert haben, auf 'Alle haben stationiert' klicken)*",
                 view=failed_view,
             )
+            failed_view.message = msg
         except discord.Forbidden:
             print("Officer hat DMs deaktiviert - Failed-to-set wird nicht erfasst")
             if is_last_phase:
@@ -643,6 +645,7 @@ async def on_ready():
     print(f"Eingeloggt als {bot.user} (ID: {bot.user.id})")
     print(f"   tw_channel  : {TW_CHANNEL_ID}")
     print(f"   officer     : {OFFICER_ID}")
+    print(f"   manager_ids : {MANAGER_IDS or '(keine)'}")
     print(f"   rolle       : {MEMBER_ROLE_ID}")
 
 
