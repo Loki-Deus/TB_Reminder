@@ -1,19 +1,21 @@
+version: "3.8"
+
 services:
-  tb-bot:
-    build: .
+  tb-reminder:
+    image: tb-reminder:latest
     container_name: tb-reminder
     restart: unless-stopped
-
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - TW_CHANNEL_ID=${TW_CHANNEL_ID}
       - OFFICER_ID=${OFFICER_ID}
-      - MEMBER_ROLE_ID=${MEMBER_ROLE_ID}
       - MANAGER_IDS=${MANAGER_IDS}
+      - MEMBER_ROLE_ID=${MEMBER_ROLE_ID}
       - DATA_DIR=/app/data
-
     volumes:
       - tb-stats:/app/data
 
 volumes:
   tb-stats:
+    external: true
+    name: tb_reminder_tb-stats
