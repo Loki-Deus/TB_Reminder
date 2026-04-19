@@ -5,6 +5,7 @@ import asyncio
 import os
 import json
 import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,7 +29,6 @@ PHASE_END_MESSAGES = [
     "Phase 6 endet bald, holt nochmal alles raus!",
 ]
 
-# CHANGE 1: Territory Battle (not Territorialkrieg)
 GENERIC_REMINDER = "Bitte denkt dran im Territory Battle zu stationieren!"
 
 intents = discord.Intents.default()
@@ -42,15 +42,22 @@ is_running = False
 # ── Stats persistence ─────────────────────────────────────────────────────────
 # stats.json structure:
 # {
-#   "total_tbs": 3,          <- how many Territory Battles have been started total
+#   "total_tbs": 3,
+#   "current_run": {                    <- written at TB start, updated each phase, cleared on finish
+#     "active": true,
+#     "tb_index": 2,
+#     "phase": 4,                       <- last phase that completed (0 = none yet)
+#     "phase_started_at": 1712345678,   <- unix timestamp when current phase wait began
+#     "channel_id": 1279533599653232739
+#   },
 #   "players": {
 #     "<user_id>": {
 #       "name": "Spielername",
 #       "total_reminders": 7,
-#       "total_failed": 2,     <- total phases this player failed to set across all TBs
-#       "total_tbs": 3,        <- how many TBs this player was present for
-#       "tb_history": [2, 0, 3],    <- reminders per TB (0 = present but not reminded)
-#       "failed_history": [1, 0, 1] <- failed-to-set count per TB
+#       "total_failed": 2,
+#       "total_tbs": 3,
+#       "tb_history": [2, 0, 3],
+#       "failed_history": [1, 0, 1]
 #     }
 #   }
 # }
@@ -72,6 +79,24 @@ def get_tb_index(stats: dict) -> int:
     return stats.get("total_tbs", 0)
 
 
+def set_current_run(stats: dict, tb_index: int, phase: int, channel_id: int):
+    """Persist the current run state to disk. Called at TB start and after each phase."""
+    stats["current_run"] = {
+        "active": True,
+        "tb_index": tb_index,
+        "phase": phase,
+        "phase_started_at": int(time.time()),
+        "channel_id": channel_id,
+    }
+    save_stats(stats)
+
+
+def clear_current_run(stats: dict):
+    """Called when a TB sequence completes normally."""
+    stats["current_run"] = {"active": False}
+    save_stats(stats)
+
+
 def record_participation(stats: dict, members: list[discord.Member]):
     """
     Called once at TB start. Registers all current role members as
@@ -91,20 +116,17 @@ def record_participation(stats: dict, members: list[discord.Member]):
                 "failed_history": [],
             }
         player = stats["players"][uid]
-        player["name"] = m.display_name  # keep name current
+        player["name"] = m.display_name
 
-        # Pad both histories up to current TB index with 0s
         while len(player["tb_history"]) < tb_index:
             player["tb_history"].append(0)
         while len(player.setdefault("failed_history", [])) < tb_index:
             player["failed_history"].append(0)
 
-        # Add a 0 slot for this TB (will be incremented later as needed)
         player["tb_history"].append(0)
         player["failed_history"].append(0)
         player["total_tbs"] += 1
 
-    # Advance the global TB counter
     stats["total_tbs"] = tb_index + 1
     save_stats(stats)
 
@@ -159,6 +181,15 @@ def record_failed(stats: dict, failed_members: list[tuple[str, str]], tb_index: 
     save_stats(stats)
 
 
+# ── Permission helper ─────────────────────────────────────────────────────────
+
+def is_authorized(interaction: discord.Interaction) -> bool:
+    return (
+        interaction.user.guild_permissions.administrator
+        or interaction.user.id in MANAGER_IDS
+    )
+
+
 # ── Player selection UI ───────────────────────────────────────────────────────
 
 class PlayerSelectView(discord.ui.View):
@@ -169,7 +200,6 @@ class PlayerSelectView(discord.ui.View):
         self.confirmed = False
         self._skipped = False
 
-        # CHANGE 2: members are passed in already sorted alphabetically
         chunk1 = members[:25]
         chunk2 = members[25:50]
 
@@ -264,7 +294,6 @@ class PlayerSelectView(discord.ui.View):
             pass
 
 
-# CHANGE 3: New view for logging players who failed to set their troops
 class FailedSetView(discord.ui.View):
     """Officer picks players who failed to set their troops this phase."""
     def __init__(self, members: list[discord.Member], timeout: float = OFFICER_TIMEOUT):
@@ -402,7 +431,6 @@ async def handle_phase_end(
         await send_generic()
         return
 
-    # CHANGE 2: sort alphabetically before slicing to 50
     members = sorted(
         [m for m in role.members if not m.bot],
         key=lambda m: m.display_name.lower()
@@ -437,7 +465,7 @@ async def handle_phase_end(
     if reminder_view.confirmed and reminder_view.selected_ids:
         member_map = {str(m.id): m for m in members}
         sent, failed_dm = 0, 0
-        reminded = []  # (uid, name) pairs for stats
+        reminded = []
 
         for uid in reminder_view.selected_ids:
             member = member_map.get(uid)
@@ -462,9 +490,8 @@ async def handle_phase_end(
         print(f"Phase {phase_num}: {reason} - generische Nachricht wird gesendet.")
         await send_generic()
 
-    # Step 2 - Failed-to-set picker: fire and forget, does NOT block the phase loop
+    # ── Step 2: Failed-to-set picker (fire and forget) ────────────────────────
     async def send_failed_picker():
-        # Last phase gets 22h; others get next_phase_wait minus 1h buffer
         if is_last_phase:
             failed_timeout = 22 * HOURS
         elif next_phase_wait > 0:
@@ -503,21 +530,25 @@ async def handle_phase_end(
             reason = "Alle haben stationiert" if failed_view._skipped else "Timeout"
             print(f"Phase {phase_num}: {reason} - keine Fehlenden eingetragen.")
 
-        # Last phase: fire summary immediately after officer responds (or times out)
         if is_last_phase:
             await send_stats_summary(officer, stats, tb_index)
 
     asyncio.create_task(send_failed_picker())
 
 
-async def send_stats_summary(officer: discord.User, stats: dict, tb_index: int):
-    """DM the officer a ranked summary of reminders AND failed-to-set for the TB that just finished."""
+async def build_stats_messages(stats: dict, tb_index: int) -> list[str]:
+    """
+    Build the stats summary message strings for a given TB index.
+    Returns a list of message strings (up to 2: reminders + failed-to-set).
+    Shared by the automatic end-of-TB summary and /start_tb_results.
+    """
     players = stats.get("players", {})
+    messages = []
 
     rows = []
     for data in players.values():
         if len(data["tb_history"]) <= tb_index:
-            continue  # wasn't present this TB
+            continue
         reminders_this_tb = data["tb_history"][tb_index]
         failed_this_tb = (
             data["failed_history"][tb_index]
@@ -543,88 +574,128 @@ async def send_stats_summary(officer: discord.User, stats: dict, tb_index: int):
         ))
 
     if not rows:
-        await officer.send(
-            "**Territory Battle abgeschlossen!**\n"
-            "Keine Teilnehmerdaten fuer diesen TB gefunden."
-        )
-        return
+        return [f"**TB-Abschlussbericht #{tb_index + 1}**\nKeine Teilnehmerdaten fuer diesen TB gefunden."]
 
-    # ── Reminder summary (sorted: most reminded this TB first, then by overall quote) ──
+    # ── Reminder summary ──
     reminder_rows = sorted(rows, key=lambda x: (x[1], x[7]), reverse=True)
-    r_lines = ["**TB-Abschlussbericht - Erinnerungen**\n"]
+    r_lines = [f"**TB-Abschlussbericht #{tb_index + 1} - Erinnerungen**\n"]
     r_lines.append(f"{'Spieler':<20} {'Dieser TB':>10} {'TBs dabei':>10} {'Quote':>14}")
     r_lines.append("-" * 58)
+    has_reminder_data = False
     for name, rem_tb, _, total_tbs, total_reminders, _, max_possible, reminder_quote, _ in reminder_rows:
         if total_reminders == 0:
             continue
         fraction = f"({total_reminders}/{max_possible})"
         r_lines.append(f"{name:<20} {rem_tb:>10} {total_tbs:>10} {f'{reminder_quote}% {fraction}':>14}")
+        has_reminder_data = True
 
-    if len(r_lines) > 3:
-        await officer.send("```\n" + "\n".join(r_lines) + "\n```")
+    if has_reminder_data:
+        messages.append("```\n" + "\n".join(r_lines) + "\n```")
     else:
-        await officer.send(
-            "**Territory Battle abgeschlossen!**\n"
+        messages.append(
+            f"**TB-Abschlussbericht #{tb_index + 1} - Erinnerungen**\n"
             "In diesem TB wurde niemand persoenlich erinnert."
         )
 
-    # ── Failed-to-set summary (sorted: most failures this TB first, then by overall quote) ──
+    # ── Failed-to-set summary ──
     failed_rows = sorted(rows, key=lambda x: (x[2], x[8]), reverse=True)
-    f_lines = ["**TB-Abschlussbericht - Nicht stationiert**\n"]
+    f_lines = [f"**TB-Abschlussbericht #{tb_index + 1} - Nicht stationiert**\n"]
     f_lines.append(f"{'Spieler':<20} {'Dieser TB':>10} {'TBs dabei':>10} {'Quote':>14}")
     f_lines.append("-" * 58)
+    has_failed_data = False
     for name, _, fail_tb, total_tbs, _, total_failed, max_possible, _, failed_quote in failed_rows:
         if total_failed == 0:
             continue
         fraction = f"({total_failed}/{max_possible})"
         f_lines.append(f"{name:<20} {fail_tb:>10} {total_tbs:>10} {f'{failed_quote}% {fraction}':>14}")
+        has_failed_data = True
 
-    if len(f_lines) > 3:
-        await officer.send("```\n" + "\n".join(f_lines) + "\n```")
+    if has_failed_data:
+        messages.append("```\n" + "\n".join(f_lines) + "\n```")
     else:
-        await officer.send(
-            "**Territory Battle abgeschlossen!**\n"
+        messages.append(
+            f"**TB-Abschlussbericht #{tb_index + 1} - Nicht stationiert**\n"
             "In diesem TB hat niemand das Stationieren verpasst - gut gemacht!"
         )
 
+    return messages
 
-async def run_sequence(tw_channel: discord.TextChannel):
+
+async def send_stats_summary(officer: discord.User, stats: dict, tb_index: int):
+    """DM the officer the stats summary. Called automatically at end of TB."""
+    messages = await build_stats_messages(stats, tb_index)
+    for msg in messages:
+        await officer.send(msg)
+
+
+async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, phase_elapsed: float = 0.0):
+    """
+    Main TB sequence.
+    start_phase:    phase index (0-5) to start from. Used by /resume_tb.
+    phase_elapsed:  seconds already elapsed in the current phase wait. Used by /resume_tb.
+    """
     global is_running
     stats = load_stats()
-    tb_index = get_tb_index(stats)
+
+    # On resume, reuse the persisted tb_index. On fresh start, derive from record_participation.
+    if start_phase > 0:
+        tb_index = stats.get("current_run", {}).get("tb_index", get_tb_index(stats) - 1)
+    else:
+        tb_index = get_tb_index(stats)  # will be updated after record_participation
 
     try:
         guild = tw_channel.guild
         role  = guild.get_role(MEMBER_ROLE_ID)
+        members = []
         if role:
-            # CHANGE 2: sort alphabetically
             members = sorted(
                 [m for m in role.members if not m.bot],
                 key=lambda m: m.display_name.lower()
             )[:50]
-            record_participation(stats, members)
-            print(f"{len(members)} Spieler als TB-Teilnehmer registriert.")
-        else:
-            print("Rolle nicht gefunden - Teilnahme wird nicht getrackt.")
 
-        # CHANGE 1: Territory Battle
-        await tw_channel.send("@everyone Ein neues Territory Battle hat gestartet!")
-        print(f"TB-Startnachricht gesendet. (TB #{tb_index + 1} in den Stats)")
+        if start_phase == 0:
+            # Fresh start: record participation and announce
+            if members:
+                record_participation(stats, members)
+                tb_index = get_tb_index(stats) - 1  # updated by record_participation
+                print(f"{len(members)} Spieler als TB-Teilnehmer registriert.")
+            else:
+                print("Rolle nicht gefunden oder keine Mitglieder - Teilnahme wird nicht getrackt.")
+
+            await tw_channel.send("@everyone Ein neues Territory Battle hat gestartet!")
+            print(f"TB-Startnachricht gesendet. (TB #{tb_index + 1} in den Stats)")
+        else:
+            print(f"TB-Sequenz wird ab Phase {start_phase + 1} fortgesetzt. (TB #{tb_index + 1})")
+
+        # Persist run state to disk
+        set_current_run(stats, tb_index, start_phase, tw_channel.id)
 
         carry_over = 0.0
-        for i in range(6):
-            wait_seconds = (22 * HOURS if i == 0 else 24 * HOURS) - carry_over
+        for i in range(start_phase, 6):
+            if i == start_phase and phase_elapsed > 0:
+                # Resume: subtract already-elapsed time from this phase's wait
+                base_wait = 22 * HOURS if i == 0 else 24 * HOURS
+                wait_seconds = max(0, base_wait - phase_elapsed)
+                print(f"Phase {i + 1}: noch {wait_seconds / HOURS:.2f}h verbleibend (Resumption).")
+            else:
+                wait_seconds = (22 * HOURS if i == 0 else 24 * HOURS) - carry_over
+
             next_phase_wait = 24 * HOURS if i < 5 else 0
             last_phase = (i == 5)
+
             print(f"Warte {wait_seconds / HOURS:.2f}h bis Phase {i + 1} endet...")
             await asyncio.sleep(max(0, wait_seconds))
+
+            # Update persisted phase state before handling
+            set_current_run(stats, tb_index, i + 1, tw_channel.id)
+
             t0 = time.monotonic()
             await handle_phase_end(i, tw_channel, stats, tb_index, next_phase_wait, last_phase)
             carry_over = time.monotonic() - t0
             print(f"Phase {i + 1} Interaktion dauerte {carry_over / 60:.1f} min - wird von naechster Phase abgezogen.")
 
-        # Summary is now triggered from within the phase 6 failed picker background task
-        print("Alle 6 Phasen abgeschlossen. Territory Battle Sequenz beendet.")
+        print("Alle Phasen abgeschlossen. Territory Battle Sequenz beendet.")
+        clear_current_run(stats)
 
     except Exception as e:
         print(f"Unerwarteter Fehler: {e}")
@@ -635,7 +706,7 @@ async def run_sequence(tw_channel: discord.TextChannel):
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
-@bot.event  # fixed: duplicate @bot.event decorator removed
+@bot.event
 async def on_ready():
     guild = discord.Object(id=1269591429227745332)
     tree.clear_commands(guild=guild)
@@ -648,20 +719,29 @@ async def on_ready():
     print(f"   manager_ids : {MANAGER_IDS or '(keine)'}")
     print(f"   rolle       : {MEMBER_ROLE_ID}")
 
+    # Warn if an interrupted run is detected in stats.json
+    stats = load_stats()
+    run = stats.get("current_run", {})
+    if run.get("active"):
+        phase = run.get("phase", 0)
+        elapsed = int(time.time()) - run.get("phase_started_at", int(time.time()))
+        print(
+            f"⚠️  Unterbrochener TB gefunden! "
+            f"Phase {phase} war zuletzt aktiv, ~{elapsed // 3600}h {(elapsed % 3600) // 60}min sind vergangen. "
+            f"Nutze /resume_tb zum Fortfahren."
+        )
+
 
 @tree.command(name="start_tb_bot", description="Startet die Territory Battle Phasen-Ankuendigungen")
 async def start(interaction: discord.Interaction):
-    is_admin   = interaction.user.guild_permissions.administrator
-    is_manager = interaction.user.id in MANAGER_IDS
-
-    if not is_admin and not is_manager:
+    if not is_authorized(interaction):
         await interaction.response.send_message(
             "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
             ephemeral=True,
         )
         return
-    global is_running
 
+    global is_running
     if is_running:
         await interaction.response.send_message(
             "Eine Territory Battle Sequenz laeuft bereits! Warte bis sie abgeschlossen ist.",
@@ -684,6 +764,161 @@ async def start(interaction: discord.Interaction):
 
     is_running = True
     asyncio.create_task(run_sequence(channel))
+
+
+@tree.command(name="start_tb_timer", description="Startet die TB-Sequenz automatisch zu einem bestimmten Zeitpunkt")
+@app_commands.describe(start_time="Startzeit im Format: DD.MM.YYYY HH:MM (UTC)")
+async def start_tb_timer(interaction: discord.Interaction, start_time: str):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    global is_running
+    if is_running:
+        await interaction.response.send_message(
+            "Eine Territory Battle Sequenz laeuft bereits!",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        target_dt = datetime.strptime(start_time.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        await interaction.response.send_message(
+            "Ungültiges Zeitformat. Bitte verwende: `DD.MM.YYYY HH:MM` (z.B. `15.04.2026 14:00`)",
+            ephemeral=True,
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    wait_seconds = (target_dt - now).total_seconds()
+
+    if wait_seconds <= 0:
+        await interaction.response.send_message(
+            "Der angegebene Zeitpunkt liegt in der Vergangenheit!",
+            ephemeral=True,
+        )
+        return
+
+    channel = bot.get_channel(TW_CHANNEL_ID)
+    if channel is None:
+        await interaction.response.send_message(
+            f"Kanal mit ID `{TW_CHANNEL_ID}` nicht gefunden. Bitte `.env` pruefen.",
+            ephemeral=True,
+        )
+        return
+
+    target_ts = int(target_dt.timestamp())
+    await interaction.response.send_message(
+        f"Timer gesetzt! TB startet <t:{target_ts}:F> (<t:{target_ts}:R>) in {channel.mention}.",
+        ephemeral=True,
+    )
+    print(f"TB-Timer gesetzt: Start in {wait_seconds / 3600:.2f}h um {target_dt.strftime('%d.%m.%Y %H:%M')} UTC")
+
+    async def delayed_start():
+        global is_running
+        await asyncio.sleep(wait_seconds)
+        if is_running:
+            print("TB-Timer abgelaufen, aber Sequenz laeuft bereits - abgebrochen.")
+            return
+        is_running = True
+        await run_sequence(channel)
+
+    asyncio.create_task(delayed_start())
+
+
+@tree.command(name="resume_tb", description="Setzt eine unterbrochene TB-Sequenz fort")
+@app_commands.describe(
+    phase="Phase bei der fortgesetzt wird (1-6, welche Phase als naechstes endet)",
+    hours_elapsed="Wie viele Stunden der aktuellen Wartezeit bereits vergangen sind (optional, wird aus gespeichertem Status berechnet)"
+)
+async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed: float = 0.0):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    global is_running
+    if is_running:
+        await interaction.response.send_message(
+            "Eine Territory Battle Sequenz laeuft bereits!",
+            ephemeral=True,
+        )
+        return
+
+    if not 1 <= phase <= 6:
+        await interaction.response.send_message(
+            "Phase muss zwischen 1 und 6 liegen.",
+            ephemeral=True,
+        )
+        return
+
+    stats = load_stats()
+    run = stats.get("current_run", {})
+
+    # Auto-calculate elapsed time from persisted timestamp if not manually provided
+    if hours_elapsed == 0.0 and run.get("active") and run.get("phase_started_at"):
+        hours_elapsed = (int(time.time()) - run["phase_started_at"]) / HOURS
+        print(f"Elapsed time aus gespeichertem Status: {hours_elapsed:.2f}h")
+
+    channel = bot.get_channel(TW_CHANNEL_ID)
+    if channel is None:
+        await interaction.response.send_message(
+            f"Kanal mit ID `{TW_CHANNEL_ID}` nicht gefunden.",
+            ephemeral=True,
+        )
+        return
+
+    phase_index = phase - 1
+    elapsed_seconds = hours_elapsed * HOURS
+    base_wait = 22 * HOURS if phase_index == 0 else 24 * HOURS
+    remaining = max(0, base_wait - elapsed_seconds)
+
+    await interaction.response.send_message(
+        f"TB-Sequenz wird ab Phase {phase} fortgesetzt.\n"
+        f"Verbleibende Wartezeit fuer diese Phase: **{remaining / HOURS:.1f}h**\n"
+        f"Nachrichten gehen in {channel.mention}.",
+        ephemeral=True,
+    )
+    print(f"TB resume: Phase {phase}, {hours_elapsed:.2f}h vergangen, {remaining / HOURS:.2f}h verbleibend.")
+
+    is_running = True
+    asyncio.create_task(run_sequence(channel, start_phase=phase_index, phase_elapsed=elapsed_seconds))
+
+
+@tree.command(name="start_tb_results", description="Zeigt den TB-Abschlussbericht in diesem Kanal an")
+async def start_tb_results(interaction: discord.Interaction):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    stats = load_stats()
+    total_tbs = stats.get("total_tbs", 0)
+
+    if total_tbs == 0:
+        await interaction.response.send_message(
+            "Noch keine TB-Daten vorhanden.",
+            ephemeral=True,
+        )
+        return
+
+    tb_index = total_tbs - 1
+    await interaction.response.send_message(
+        f"Lade TB-Abschlussbericht #{tb_index + 1}...",
+        ephemeral=True,
+    )
+
+    messages = await build_stats_messages(stats, tb_index)
+    for msg in messages:
+        await interaction.channel.send(msg)
 
 
 bot.run(TOKEN)
