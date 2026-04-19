@@ -921,4 +921,40 @@ async def start_tb_results(interaction: discord.Interaction):
         await interaction.channel.send(msg)
 
 
+@tree.command(name="start_tb_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
+async def help_command(interaction: discord.Interaction):
+    help_text = (
+        "## TB-Reminder Bot — Befehlsuebersicht\n\n"
+
+        "### 🟢 TB starten\n"
+        "**`/start_tb_bot`**\n"
+        "Startet die TB-Sequenz sofort. Der Bot kündigt den TB-Start im konfigurierten Kanal an "
+        "und kontaktiert den Officer automatisch am Ende jeder Phase.\n\n"
+
+        "**`/start_tb_timer start_time: DD.MM.YYYY HH:MM`**\n"
+        "Plant den TB-Start zu einem bestimmten Zeitpunkt (UTC).\n"
+        "Beispiel: `/start_tb_timer start_time: 20.04.2026 18:00`\n\n"
+
+        "### 🔄 TB fortsetzen\n"
+        "**`/resume_tb phase: <1-6> [hours_elapsed: <Stunden>]`**\n"
+        "Setzt eine unterbrochene TB-Sequenz fort (z.B. nach Server-Neustart).\n"
+        "`phase` = welche Phase als nächstes endet.\n"
+        "`hours_elapsed` = wie viele Stunden der aktuellen Wartezeit bereits vergangen sind. "
+        "Wird automatisch aus dem gespeicherten Status berechnet, falls vorhanden.\n"
+        "Beispiel: `/resume_tb phase: 6 hours_elapsed: 19.5`\n\n"
+
+        "### 📊 Ergebnisse\n"
+        "**`/start_tb_results`**\n"
+        "Postet den Abschlussbericht des letzten TBs in diesen Kanal. "
+        "Zeigt Erinnerungen und nicht-stationierte Spieler mit Gesamtquoten.\n\n"
+
+        "### ℹ️ Sonstiges\n"
+        "**`/start_tb_help`**\n"
+        "Zeigt diese Uebersicht.\n\n"
+
+        "-# Alle Befehle erfordern Administrator-Rechte oder Officer-Status."
+    )
+    await interaction.response.send_message(help_text, ephemeral=True)
+
+
 bot.run(TOKEN)
