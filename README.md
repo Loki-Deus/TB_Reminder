@@ -21,7 +21,8 @@ Alle Befehle erfordern **Administrator-Rechte** oder Eintrag in `MANAGER_IDS`.
 | Befehl | Beschreibung |
 |---|---|
 | `/start_tb_bot` | Startet die TB-Sequenz sofort |
-| `/start_tb_timer start_time: DD.MM.YYYY HH:MM` | Plant den TB-Start zu einem bestimmten Zeitpunkt (UTC) |
+| `/start_tb_timer start_time: DD.MM.YYYY HH:MM` | Plant den TB-Start zu einem bestimmten Zeitpunkt (Serverzeit) — zeigt Bestätigungsdialog |
+| `/cancel_tb` | Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab |
 | `/resume_tb phase: <1-6> [hours_elapsed: <h>]` | Setzt eine unterbrochene Sequenz fort |
 | `/start_tb_results` | Postet den Abschlussbericht des letzten TBs im aktuellen Kanal |
 | `/start_tb_help` | Zeigt alle Befehle mit Beschreibung direkt in Discord |
@@ -85,6 +86,7 @@ cp .env.example .env
 | `MEMBER_ROLE_ID` | ID der Rolle deren Mitglieder getrackt werden |
 | `MANAGER_IDS` | Komma-separierte User-IDs die Bot-Befehle ausführen dürfen (optional) |
 | `DATA_DIR` | Verzeichnis für `stats.json` (Standard: aktuelles Verzeichnis) |
+| `BOT_TIMEZONE` | Zeitzone für `/start_tb_timer` (Standard: `Europe/Vienna`) |
 
 ### 4. Deployment (Docker / Portainer)
 

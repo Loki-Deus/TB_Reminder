@@ -6,6 +6,7 @@ import os
 import json
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,6 +20,7 @@ MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID"))
 HOURS = 3600
 OFFICER_TIMEOUT = 1 * HOURS
 STATS_FILE = os.path.join(os.getenv("DATA_DIR", "."), "stats.json")
+BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Vienna"))
 
 PHASE_END_MESSAGES = [
     "Phase 1 endet bald!",
@@ -37,9 +39,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 is_running = False
+pending_timer: asyncio.Task | None = None
 
 
-# ── Stats persistence ─────────────────────────────────────────────────────────
 # stats.json structure:
 # {
 #   "total_tbs": 3,
@@ -767,7 +769,7 @@ async def start(interaction: discord.Interaction):
 
 
 @tree.command(name="start_tb_timer", description="Startet die TB-Sequenz automatisch zu einem bestimmten Zeitpunkt")
-@app_commands.describe(start_time="Startzeit im Format: DD.MM.YYYY HH:MM (UTC)")
+@app_commands.describe(start_time="Startzeit im Format: DD.MM.YYYY HH:MM (Serverzeit)")
 async def start_tb_timer(interaction: discord.Interaction, start_time: str):
     if not is_authorized(interaction):
         await interaction.response.send_message(
@@ -776,7 +778,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
         )
         return
 
-    global is_running
+    global is_running, pending_timer
     if is_running:
         await interaction.response.send_message(
             "Eine Territory Battle Sequenz laeuft bereits!",
@@ -784,16 +786,24 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
         )
         return
 
-    try:
-        target_dt = datetime.strptime(start_time.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=timezone.utc)
-    except ValueError:
+    if pending_timer and not pending_timer.done():
         await interaction.response.send_message(
-            "Ungültiges Zeitformat. Bitte verwende: `DD.MM.YYYY HH:MM` (z.B. `15.04.2026 14:00`)",
+            "Es laeuft bereits ein Timer! Nutze `/cancel_tb` um ihn abzubrechen.",
             ephemeral=True,
         )
         return
 
-    now = datetime.now(timezone.utc)
+    try:
+        # Parse as local server time (BOT_TZ), not UTC
+        target_dt = datetime.strptime(start_time.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=BOT_TZ)
+    except ValueError:
+        await interaction.response.send_message(
+            "Ungültiges Zeitformat. Bitte verwende: `DD.MM.YYYY HH:MM` (z.B. `27.04.2026 18:00`)",
+            ephemeral=True,
+        )
+        return
+
+    now = datetime.now(BOT_TZ)
     wait_seconds = (target_dt - now).total_seconds()
 
     if wait_seconds <= 0:
@@ -812,22 +822,70 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
         return
 
     target_ts = int(target_dt.timestamp())
+    tz_name = target_dt.strftime("%Z")
+
+    # Send confirmation view before setting the timer
+    class ConfirmTimerView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.confirmed = False
+
+        @discord.ui.button(label="Bestaetigen", style=discord.ButtonStyle.green)
+        async def confirm(self, confirm_interaction: discord.Interaction, button: discord.ui.Button):
+            self.confirmed = True
+            await confirm_interaction.response.edit_message(
+                content=f"✅ Timer gesetzt! TB startet <t:{target_ts}:F> (<t:{target_ts}:R>) in {channel.mention}.",
+                view=None,
+            )
+            self.stop()
+
+        @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.red)
+        async def cancel(self, cancel_interaction: discord.Interaction, button: discord.ui.Button):
+            self.confirmed = False
+            await cancel_interaction.response.edit_message(
+                content="Timer abgebrochen.",
+                view=None,
+            )
+            self.stop()
+
+        async def on_timeout(self):
+            self.confirmed = False
+            try:
+                await self.message.edit(content="Keine Bestaetigung - Timer nicht gesetzt.", view=None)
+            except Exception:
+                pass
+
+    confirm_view = ConfirmTimerView()
     await interaction.response.send_message(
-        f"Timer gesetzt! TB startet <t:{target_ts}:F> (<t:{target_ts}:R>) in {channel.mention}.",
+        f"⏰ TB-Timer bestätigen:\n"
+        f"Startzeit: **{target_dt.strftime('%d.%m.%Y %H:%M')} {tz_name}** (<t:{target_ts}:R>)\n"
+        f"Kanal: {channel.mention}\n\n"
+        f"Ist das korrekt?",
+        view=confirm_view,
         ephemeral=True,
     )
-    print(f"TB-Timer gesetzt: Start in {wait_seconds / 3600:.2f}h um {target_dt.strftime('%d.%m.%Y %H:%M')} UTC")
+    confirm_view.message = await interaction.original_response()
+    await confirm_view.wait()
+
+    if not confirm_view.confirmed:
+        return
+
+    print(f"TB-Timer gesetzt: Start in {wait_seconds / 3600:.2f}h um {target_dt.strftime('%d.%m.%Y %H:%M')} {tz_name}")
 
     async def delayed_start():
-        global is_running
-        await asyncio.sleep(wait_seconds)
+        global is_running, pending_timer
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            print("TB-Timer wurde abgebrochen.")
+            return
         if is_running:
             print("TB-Timer abgelaufen, aber Sequenz laeuft bereits - abgebrochen.")
             return
         is_running = True
         await run_sequence(channel)
 
-    asyncio.create_task(delayed_start())
+    pending_timer = asyncio.create_task(delayed_start())
 
 
 @tree.command(name="resume_tb", description="Setzt eine unterbrochene TB-Sequenz fort")
@@ -921,6 +979,44 @@ async def start_tb_results(interaction: discord.Interaction):
         await interaction.channel.send(msg)
 
 
+@tree.command(name="cancel_tb", description="Bricht einen laufenden TB-Timer oder eine aktive TB-Sequenz ab")
+async def cancel_tb(interaction: discord.Interaction):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    global is_running, pending_timer
+
+    if pending_timer and not pending_timer.done():
+        pending_timer.cancel()
+        pending_timer = None
+        await interaction.response.send_message(
+            "⛔ TB-Timer wurde abgebrochen. Kein Territory Battle wird gestartet.",
+            ephemeral=True,
+        )
+        print("TB-Timer manuell abgebrochen.")
+        return
+
+    if is_running:
+        is_running = False
+        stats = load_stats()
+        clear_current_run(stats)
+        await interaction.response.send_message(
+            "⛔ TB-Sequenz wurde abgebrochen. Stats wurden gespeichert.",
+            ephemeral=True,
+        )
+        print("TB-Sequenz manuell abgebrochen.")
+        return
+
+    await interaction.response.send_message(
+        "Kein aktiver Timer oder Sequenz gefunden.",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="start_tb_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
 async def help_command(interaction: discord.Interaction):
     help_text = (
@@ -932,7 +1028,8 @@ async def help_command(interaction: discord.Interaction):
         "und kontaktiert den Officer automatisch am Ende jeder Phase.\n\n"
 
         "**`/start_tb_timer start_time: DD.MM.YYYY HH:MM`**\n"
-        "Plant den TB-Start zu einem bestimmten Zeitpunkt (UTC).\n"
+        "Plant den TB-Start zu einem bestimmten Zeitpunkt (Serverzeit).\n"
+        "Der Bot zeigt die geplante Zeit zur Bestätigung an bevor der Timer gesetzt wird.\n"
         "Beispiel: `/start_tb_timer start_time: 20.04.2026 18:00`\n\n"
 
         "### 🔄 TB fortsetzen\n"
@@ -948,6 +1045,9 @@ async def help_command(interaction: discord.Interaction):
         "Postet den Abschlussbericht des letzten TBs in diesen Kanal. "
         "Zeigt Erinnerungen und nicht-stationierte Spieler mit Gesamtquoten.\n\n"
 
+        "### ⛔ Abbrechen\n"
+        "**`/cancel_tb`**\n"
+        "Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab.\n\n"
         "### ℹ️ Sonstiges\n"
         "**`/start_tb_help`**\n"
         "Zeigt diese Uebersicht.\n\n"
@@ -958,3 +1058,4 @@ async def help_command(interaction: discord.Interaction):
 
 
 bot.run(TOKEN)
+
