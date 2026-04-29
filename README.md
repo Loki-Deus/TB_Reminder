@@ -20,14 +20,15 @@ Alle Befehle erfordern **Administrator-Rechte** oder Eintrag in `MANAGER_IDS`.
 
 | Befehl | Beschreibung |
 |---|---|
-| `/start_tb_bot` | Startet die TB-Sequenz sofort |
-| `/start_tb_timer start_time: DD.MM.YYYY HH:MM` | Plant den TB-Start zu einem bestimmten Zeitpunkt (Serverzeit) — zeigt Bestätigungsdialog |
-| `/cancel_tb` | Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab |
-| `/resume_tb phase: <1-6> [hours_elapsed: <h>]` | Setzt eine unterbrochene Sequenz fort |
-| `/start_tb_results` | Postet den Abschlussbericht des letzten TBs im aktuellen Kanal |
-| `/start_tb_help` | Zeigt alle Befehle mit Beschreibung direkt in Discord |
+| `/TBReminder_start` | Startet die TB-Sequenz sofort |
+| `/TBReminder_timer start_time: DD.MM.YYYY HH:MM` | Plant den TB-Start zu einem bestimmten Zeitpunkt (Serverzeit) — zeigt Bestätigungsdialog |
+| `/TBReminder_resume phase: <1-6> [hours_elapsed: <h>]` | Setzt eine unterbrochene Sequenz fort |
+| `/TBReminder_status` | Zeigt Phasenbeginn, Officer-Erinnerungszeit und Phasenende |
+| `/TBReminder_cancel` | Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab |
+| `/TBReminder_results` | Postet den Abschlussbericht des letzten TBs im aktuellen Kanal |
+| `/TBReminder_help` | Zeigt alle Befehle mit Beschreibung direkt in Discord |
 
-### `/resume_tb` — Wann und wie verwenden
+### `/TBReminder_resume` — Wann und wie verwenden
 
 Nach einem Server-Neustart oder Container-Absturz läuft die Sequenz nicht mehr. Der Bot erkennt einen unterbrochenen TB beim Start und loggt eine Warnung:
 
@@ -38,12 +39,12 @@ Nach einem Server-Neustart oder Container-Absturz läuft die Sequenz nicht mehr.
 
 **Automatisch** (empfohlen — ab dem zweiten Absturz, sobald `phase_started_at` im stats.json vorhanden ist):
 ```
-/resume_tb phase: 4
+/TBReminder_resume phase: 4
 ```
 
 **Manuell** (bei erstem Einsatz oder wenn der Zeitstempel unbekannt ist):
 ```
-/resume_tb phase: 4 hours_elapsed: 2.25
+/TBReminder_resume phase: 4 hours_elapsed: 2.25
 ```
 `hours_elapsed` = Stunden seit Beginn der aktuellen Phasen-Wartezeit.
 Berechnung: `(Phasenlänge in Stunden) - (verbleibende Stunden bis Phasenende)`
@@ -120,7 +121,7 @@ Der Bot trackt folgende Daten über alle TBs hinweg in `stats.json`:
 
 Der Abschlussbericht wird automatisch per DM an den Officer gesendet sobald der Officer nach Phase 6 die Fehlenden-Liste einreicht (oder die Zeit abläuft). Er kann jederzeit auch manuell mit `/start_tb_results` abgerufen werden.
 
-**Hinweis:** Wenn der Bot während eines laufenden TBs neu gestartet wird, gehen nur die In-Memory-Daten der laufenden Phase verloren. Die `stats.json` bleibt vollständig erhalten. Die Sequenz kann mit `/resume_tb` fortgesetzt werden.
+**Hinweis:** Wenn der Bot während eines laufenden TBs neu gestartet wird, gehen nur die In-Memory-Daten der laufenden Phase verloren. Die `stats.json` bleibt vollständig erhalten. Die Sequenz kann mit `/TBReminder_resume` fortgesetzt werden.
 
 ---
 

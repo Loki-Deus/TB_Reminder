@@ -81,13 +81,18 @@ def get_tb_index(stats: dict) -> int:
     return stats.get("total_tbs", 0)
 
 
-def set_current_run(stats: dict, tb_index: int, phase: int, channel_id: int):
-    """Persist the current run state to disk. Called at TB start and after each phase."""
+def set_current_run(stats: dict, tb_index: int, phase: int, channel_id: int, update_timestamp: bool = True):
+    """
+    Persist the current run state to disk.
+    update_timestamp=True  -> fresh phase transition, write new phase_started_at
+    update_timestamp=False -> resume only, preserve existing phase_started_at
+    """
+    existing = stats.get("current_run", {})
     stats["current_run"] = {
         "active": True,
         "tb_index": tb_index,
         "phase": phase,
-        "phase_started_at": int(time.time()),
+        "phase_started_at": int(time.time()) if update_timestamp else existing.get("phase_started_at", int(time.time())),
         "channel_id": channel_id,
     }
     save_stats(stats)
@@ -472,13 +477,27 @@ async def handle_phase_end(
         for uid in reminder_view.selected_ids:
             member = member_map.get(uid)
             if member:
-                try:
-                    await member.send(f"{phase_msg}")
-                    sent += 1
-                    reminded.append((uid, member.display_name))
-                except discord.Forbidden:
-                    print(f"Konnte {member.display_name} keine DM senden (DMs deaktiviert)")
-                    failed_dm += 1
+                for attempt in range(3):
+                    try:
+                        await member.send(f"{phase_msg}")
+                        sent += 1
+                        reminded.append((uid, member.display_name))
+                        break
+                    except discord.Forbidden:
+                        print(f"Konnte {member.display_name} keine DM senden (DMs deaktiviert)")
+                        failed_dm += 1
+                        break
+                    except discord.DiscordServerError as e:
+                        if attempt < 2:
+                            print(f"Discord 503 beim Senden an {member.display_name}, Versuch {attempt + 1}/3 - warte 5s...")
+                            await asyncio.sleep(5)
+                        else:
+                            print(f"Discord 503 beim Senden an {member.display_name} nach 3 Versuchen - uebersprungen.")
+                            failed_dm += 1
+                    except Exception as e:
+                        print(f"Unerwarteter Fehler beim Senden an {member.display_name}: {e} - uebersprungen.")
+                        failed_dm += 1
+                        break
 
         record_reminders(stats, reminded, tb_index)
 
@@ -670,7 +689,8 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
             print(f"TB-Sequenz wird ab Phase {start_phase + 1} fortgesetzt. (TB #{tb_index + 1})")
 
         # Persist run state to disk
-        set_current_run(stats, tb_index, start_phase, tw_channel.id)
+        # On resume (start_phase > 0), preserve existing phase_started_at
+        set_current_run(stats, tb_index, start_phase, tw_channel.id, update_timestamp=(start_phase == 0))
 
         carry_over = 0.0
         for i in range(start_phase, 6):
@@ -734,7 +754,7 @@ async def on_ready():
         )
 
 
-@tree.command(name="start_tb_bot", description="Startet die Territory Battle Phasen-Ankuendigungen")
+@tree.command(name="TBReminder_start", description="Startet die Territory Battle Phasen-Ankuendigungen")
 async def start(interaction: discord.Interaction):
     if not is_authorized(interaction):
         await interaction.response.send_message(
@@ -768,7 +788,7 @@ async def start(interaction: discord.Interaction):
     asyncio.create_task(run_sequence(channel))
 
 
-@tree.command(name="start_tb_timer", description="Startet die TB-Sequenz automatisch zu einem bestimmten Zeitpunkt")
+@tree.command(name="TBReminder_timer", description="Startet die TB-Sequenz automatisch zu einem bestimmten Zeitpunkt")
 @app_commands.describe(start_time="Startzeit im Format: DD.MM.YYYY HH:MM (Serverzeit)")
 async def start_tb_timer(interaction: discord.Interaction, start_time: str):
     if not is_authorized(interaction):
@@ -888,7 +908,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
     pending_timer = asyncio.create_task(delayed_start())
 
 
-@tree.command(name="resume_tb", description="Setzt eine unterbrochene TB-Sequenz fort")
+@tree.command(name="TBReminder_resume", description="Setzt eine unterbrochene TB-Sequenz fort")
 @app_commands.describe(
     phase="Phase bei der fortgesetzt wird (1-6, welche Phase als naechstes endet)",
     hours_elapsed="Wie viele Stunden der aktuellen Wartezeit bereits vergangen sind (optional, wird aus gespeichertem Status berechnet)"
@@ -949,7 +969,7 @@ async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed:
     asyncio.create_task(run_sequence(channel, start_phase=phase_index, phase_elapsed=elapsed_seconds))
 
 
-@tree.command(name="start_tb_results", description="Zeigt den TB-Abschlussbericht in diesem Kanal an")
+@tree.command(name="TBReminder_results", description="Zeigt den TB-Abschlussbericht in diesem Kanal an")
 async def start_tb_results(interaction: discord.Interaction):
     if not is_authorized(interaction):
         await interaction.response.send_message(
@@ -979,7 +999,7 @@ async def start_tb_results(interaction: discord.Interaction):
         await interaction.channel.send(msg)
 
 
-@tree.command(name="cancel_tb", description="Bricht einen laufenden TB-Timer oder eine aktive TB-Sequenz ab")
+@tree.command(name="TBReminder_cancel", description="Bricht einen laufenden TB-Timer oder eine aktive TB-Sequenz ab")
 async def cancel_tb(interaction: discord.Interaction):
     if not is_authorized(interaction):
         await interaction.response.send_message(
@@ -1017,39 +1037,93 @@ async def cancel_tb(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="start_tb_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
+
+
+@tree.command(name="TBReminder_status", description="Zeigt den aktuellen TB-Status: Phasenbeginn, Erinnerungszeit, Phasenende")
+async def tb_status(interaction: discord.Interaction):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    stats = load_stats()
+    run = stats.get("current_run", {})
+
+    if not run.get("active"):
+        await interaction.response.send_message(
+            "Kein aktiver Territory Battle.",
+            ephemeral=True,
+        )
+        return
+
+    tb_index   = run.get("tb_index", 0)
+    phase      = run.get("phase", 0)
+    started_at = run.get("phase_started_at")
+
+    if not started_at:
+        await interaction.response.send_message(
+            "Status nicht verfuegbar - keine Zeitinformation gespeichert.",
+            ephemeral=True,
+        )
+        return
+
+    phase_duration = 22 * HOURS if phase == 0 else 24 * HOURS
+    phase_end_ts   = started_at + int(phase_duration)
+    reminder_ts    = phase_end_ts - int(OFFICER_TIMEOUT)  # officer DM fires 1h before phase end
+
+    phase_num = phase + 1  # phase in current_run is the last completed phase, so next is phase+1
+
+    await interaction.response.send_message(
+        f"**📊 TB #{tb_index + 1} — Phase {phase_num} laeuft**
+
+"
+        f"Phase gestartet:        <t:{started_at}:F>
+"
+        f"Officer wird erinnert:  <t:{reminder_ts}:F> (<t:{reminder_ts}:R>)
+"
+        f"Phase endet:            <t:{phase_end_ts}:F> (<t:{phase_end_ts}:R>)",
+        ephemeral=True,
+    )
+
+@tree.command(name="TBReminder_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
 async def help_command(interaction: discord.Interaction):
     help_text = (
         "## TB-Reminder Bot — Befehlsuebersicht\n\n"
 
         "### 🟢 TB starten\n"
-        "**`/start_tb_bot`**\n"
-        "Startet die TB-Sequenz sofort. Der Bot kündigt den TB-Start im konfigurierten Kanal an "
+        "**`/TBReminder_start`**\n"
+        "Startet die TB-Sequenz sofort. Der Bot kuendigt den TB-Start im konfigurierten Kanal an "
         "und kontaktiert den Officer automatisch am Ende jeder Phase.\n\n"
 
-        "**`/start_tb_timer start_time: DD.MM.YYYY HH:MM`**\n"
+        "**`/TBReminder_timer start_time: DD.MM.YYYY HH:MM`**\n"
         "Plant den TB-Start zu einem bestimmten Zeitpunkt (Serverzeit).\n"
-        "Der Bot zeigt die geplante Zeit zur Bestätigung an bevor der Timer gesetzt wird.\n"
-        "Beispiel: `/start_tb_timer start_time: 20.04.2026 18:00`\n\n"
+        "Der Bot zeigt die geplante Zeit zur Bestaetigung an bevor der Timer gesetzt wird.\n"
+        "Beispiel: `/TBReminder_timer start_time: 20.04.2026 18:00`\n\n"
 
-        "### 🔄 TB fortsetzen\n"
-        "**`/resume_tb phase: <1-6> [hours_elapsed: <Stunden>]`**\n"
+        "### 🔄 TB fortsetzen & Status\n"
+        "**`/TBReminder_resume phase: <1-6> [hours_elapsed: <Stunden>]`**\n"
         "Setzt eine unterbrochene TB-Sequenz fort (z.B. nach Server-Neustart).\n"
-        "`phase` = welche Phase als nächstes endet.\n"
+        "`phase` = welche Phase als naechstes endet.\n"
         "`hours_elapsed` = wie viele Stunden der aktuellen Wartezeit bereits vergangen sind. "
         "Wird automatisch aus dem gespeicherten Status berechnet, falls vorhanden.\n"
-        "Beispiel: `/resume_tb phase: 6 hours_elapsed: 19.5`\n\n"
+        "Beispiel: `/TBReminder_resume phase: 6 hours_elapsed: 19.5`\n\n"
+
+        "**`/TBReminder_status`**\n"
+        "Zeigt den aktuellen TB-Status: wann die Phase gestartet ist, wann der Officer erinnert wird, wann die Phase endet.\n\n"
 
         "### 📊 Ergebnisse\n"
-        "**`/start_tb_results`**\n"
+        "**`/TBReminder_results`**\n"
         "Postet den Abschlussbericht des letzten TBs in diesen Kanal. "
         "Zeigt Erinnerungen und nicht-stationierte Spieler mit Gesamtquoten.\n\n"
 
         "### ⛔ Abbrechen\n"
-        "**`/cancel_tb`**\n"
+        "**`/TBReminder_cancel`**\n"
         "Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab.\n\n"
+
         "### ℹ️ Sonstiges\n"
-        "**`/start_tb_help`**\n"
+        "**`/TBReminder_help`**\n"
         "Zeigt diese Uebersicht.\n\n"
 
         "-# Alle Befehle erfordern Administrator-Rechte oder Officer-Status."
