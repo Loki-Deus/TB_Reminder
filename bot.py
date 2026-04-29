@@ -1076,13 +1076,9 @@ async def tb_status(interaction: discord.Interaction):
     phase_num = phase + 1  # phase in current_run is the last completed phase, so next is phase+1
 
     await interaction.response.send_message(
-        f"**📊 TB #{tb_index + 1} — Phase {phase_num} laeuft**
-
-"
-        f"Phase gestartet:        <t:{started_at}:F>
-"
-        f"Officer wird erinnert:  <t:{reminder_ts}:F> (<t:{reminder_ts}:R>)
-"
+        f"**TB #{tb_index + 1} - Phase {phase_num} laeuft**\n\n"
+        f"Phase gestartet:        <t:{started_at}:F>\n"
+        f"Officer wird erinnert:  <t:{reminder_ts}:F> (<t:{reminder_ts}:R>)\n"
         f"Phase endet:            <t:{phase_end_ts}:F> (<t:{phase_end_ts}:R>)",
         ephemeral=True,
     )
@@ -1132,4 +1128,3 @@ async def help_command(interaction: discord.Interaction):
 
 
 bot.run(TOKEN)
-
