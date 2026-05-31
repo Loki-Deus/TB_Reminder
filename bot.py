@@ -642,11 +642,45 @@ async def build_stats_messages(stats: dict, tb_index: int) -> list[str]:
     return messages
 
 
+def split_message(text: str, limit: int = 1990) -> list[str]:
+    """
+    Split a potentially-oversized message into chunks that fit within Discord's
+    2000-character limit. Splits on newlines so rows are never cut mid-line.
+    Reopens/closes code fences across chunks when the source is a code block.
+    """
+    in_code_block = text.startswith("```")
+    fence_open  = "```\n" if in_code_block else ""
+    fence_close = "\n```" if in_code_block else ""
+
+    inner = text[len(fence_open) : len(text) - len(fence_close)] if in_code_block else text
+
+    lines   = inner.split("\n")
+    chunks  = []
+    current_lines: list[str] = []
+    current_len = len(fence_open) + len(fence_close)
+
+    for line in lines:
+        added = len(line) + 1  # +1 for the \n that join() will add
+        if current_len + added > limit and current_lines:
+            chunks.append(fence_open + "\n".join(current_lines) + fence_close)
+            current_lines = [line]
+            current_len   = len(fence_open) + len(fence_close) + added
+        else:
+            current_lines.append(line)
+            current_len += added
+
+    if current_lines:
+        chunks.append(fence_open + "\n".join(current_lines) + fence_close)
+
+    return chunks
+
+
 async def send_stats_summary(officer: discord.User, stats: dict, tb_index: int):
     """DM the officer the stats summary. Called automatically at end of TB."""
     messages = await build_stats_messages(stats, tb_index)
     for msg in messages:
-        await officer.send(msg)
+        for chunk in split_message(msg):
+            await officer.send(chunk)
 
 
 async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, phase_elapsed: float = 0.0):
@@ -996,7 +1030,8 @@ async def start_tb_results(interaction: discord.Interaction):
 
     messages = await build_stats_messages(stats, tb_index)
     for msg in messages:
-        await interaction.channel.send(msg)
+        for chunk in split_message(msg):
+            await interaction.channel.send(chunk)
 
 
 @tree.command(name="tbreminder_cancel", description="Bricht einen laufenden TB-Timer oder eine aktive TB-Sequenz ab")
