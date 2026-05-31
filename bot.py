@@ -40,6 +40,7 @@ tree = bot.tree
 
 is_running = False
 pending_timer: asyncio.Task | None = None
+running_task: asyncio.Task | None = None
 
 
 # stats.json structure:
@@ -742,6 +743,10 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
             print(f"Warte {wait_seconds / HOURS:.2f}h bis Phase {i + 1} endet...")
             await asyncio.sleep(max(0, wait_seconds))
 
+            if not is_running:
+                print(f"TB-Sequenz wurde abgebrochen (nach Sleep Phase {i + 1}).")
+                return
+
             # Update persisted phase state before handling
             set_current_run(stats, tb_index, i + 1, tw_channel.id)
 
@@ -797,7 +802,7 @@ async def start(interaction: discord.Interaction):
         )
         return
 
-    global is_running
+    global is_running, running_task
     if is_running:
         await interaction.response.send_message(
             "Eine Territory Battle Sequenz laeuft bereits! Warte bis sie abgeschlossen ist.",
@@ -819,7 +824,7 @@ async def start(interaction: discord.Interaction):
     )
 
     is_running = True
-    asyncio.create_task(run_sequence(channel))
+    running_task = asyncio.create_task(run_sequence(channel))
 
 
 @tree.command(name="tbreminder_timer", description="Startet die TB-Sequenz automatisch zu einem bestimmten Zeitpunkt")
@@ -927,7 +932,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
     print(f"TB-Timer gesetzt: Start in {wait_seconds / 3600:.2f}h um {target_dt.strftime('%d.%m.%Y %H:%M')} {tz_name}")
 
     async def delayed_start():
-        global is_running, pending_timer
+        global is_running, pending_timer, running_task
         try:
             await asyncio.sleep(wait_seconds)
         except asyncio.CancelledError:
@@ -937,7 +942,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
             print("TB-Timer abgelaufen, aber Sequenz laeuft bereits - abgebrochen.")
             return
         is_running = True
-        await run_sequence(channel)
+        running_task = asyncio.create_task(run_sequence(channel))
 
     pending_timer = asyncio.create_task(delayed_start())
 
@@ -955,7 +960,7 @@ async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed:
         )
         return
 
-    global is_running
+    global is_running, running_task
     if is_running:
         await interaction.response.send_message(
             "Eine Territory Battle Sequenz laeuft bereits!",
@@ -1000,7 +1005,7 @@ async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed:
     print(f"TB resume: Phase {phase}, {hours_elapsed:.2f}h vergangen, {remaining / HOURS:.2f}h verbleibend.")
 
     is_running = True
-    asyncio.create_task(run_sequence(channel, start_phase=phase_index, phase_elapsed=elapsed_seconds))
+    running_task = asyncio.create_task(run_sequence(channel, start_phase=phase_index, phase_elapsed=elapsed_seconds))
 
 
 @tree.command(name="tbreminder_results", description="Zeigt den TB-Abschlussbericht in diesem Kanal an")
@@ -1043,7 +1048,7 @@ async def cancel_tb(interaction: discord.Interaction):
         )
         return
 
-    global is_running, pending_timer
+    global is_running, pending_timer, running_task
 
     if pending_timer and not pending_timer.done():
         pending_timer.cancel()
@@ -1055,15 +1060,42 @@ async def cancel_tb(interaction: discord.Interaction):
         print("TB-Timer manuell abgebrochen.")
         return
 
-    if is_running:
+    if is_running or (running_task and not running_task.done()):
         is_running = False
+
+        if running_task and not running_task.done():
+            running_task.cancel()
+            running_task = None
+
         stats = load_stats()
-        clear_current_run(stats)
-        await interaction.response.send_message(
-            "⛔ TB-Sequenz wurde abgebrochen. Stats wurden gespeichert.",
-            ephemeral=True,
-        )
-        print("TB-Sequenz manuell abgebrochen.")
+        run = stats.get("current_run", {})
+
+        if run.get("phase", 0) == 0:
+            # No officer interaction has happened yet — roll back completely
+            tb_index = run.get("tb_index")
+            if tb_index is not None:
+                for player in stats.get("players", {}).values():
+                    if len(player.get("tb_history", [])) > tb_index:
+                        player["tb_history"].pop(tb_index)
+                    if len(player.get("failed_history", [])) > tb_index:
+                        player["failed_history"].pop(tb_index)
+                    if player.get("total_tbs", 0) > 0:
+                        player["total_tbs"] -= 1
+                stats["total_tbs"] = max(0, stats.get("total_tbs", 1) - 1)
+            clear_current_run(stats)
+            await interaction.response.send_message(
+                "⛔ TB-Sequenz abgebrochen. Noch keine Daten vorhanden — TB-Zaehler zurueckgesetzt.",
+                ephemeral=True,
+            )
+            print("TB-Sequenz abgebrochen vor Phase 1 - Stats zurueckgerollt.")
+        else:
+            # Data exists — keep it, just stop the sequence
+            clear_current_run(stats)
+            await interaction.response.send_message(
+                "⛔ TB-Sequenz abgebrochen. Vorhandene Daten wurden behalten. Nutze `/tbreminder_resume` zum Fortfahren.",
+                ephemeral=True,
+            )
+            print(f"TB-Sequenz abgebrochen nach Phase {run.get('phase')} - Stats behalten.")
         return
 
     await interaction.response.send_message(
