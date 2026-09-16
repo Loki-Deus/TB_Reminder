@@ -3,35 +3,35 @@ from discord.ext import commands
 from discord import app_commands
 import asyncio
 import os
-import json
 import time
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
+import traceback
+from datetime import datetime
 
-load_dotenv()
+import config
+import roster_read
+import requirements
+from stats import (
+    load_stats,
+    save_stats,
+    get_tb_index,
+    set_current_run,
+    clear_current_run,
+    record_participation,
+    record_reminders,
+    record_failed,
+)
 
-TOKEN          = os.getenv("DISCORD_TOKEN")
-TW_CHANNEL_ID  = int(os.getenv("TW_CHANNEL_ID"))
-OFFICER_ID     = int(os.getenv("OFFICER_ID"))
-MANAGER_IDS    = set(int(i) for i in os.getenv("MANAGER_IDS", "").split(",") if i.strip())
-MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID"))
-
-HOURS = 3600
-OFFICER_TIMEOUT = 1 * HOURS
-STATS_FILE = os.path.join(os.getenv("DATA_DIR", "."), "stats.json")
-BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Vienna"))
-
-PHASE_END_MESSAGES = [
-    "Phase 1 endet bald!",
-    "Phase 2 endet bald!",
-    "Phase 3 endet bald!",
-    "Phase 4 endet bald!",
-    "Phase 5 endet bald!",
-    "Phase 6 endet bald, holt nochmal alles raus!",
-]
-
-GENERIC_REMINDER = "Bitte denkt dran im Territory Battle zu stationieren!"
+TOKEN           = config.TOKEN
+GUILD_ID        = config.GUILD_ID
+TW_CHANNEL_ID   = config.TW_CHANNEL_ID
+OFFICER_ID      = config.OFFICER_ID
+MANAGER_IDS     = config.MANAGER_IDS
+MEMBER_ROLE_ID  = config.MEMBER_ROLE_ID
+HOURS           = config.HOURS
+OFFICER_TIMEOUT = config.OFFICER_TIMEOUT
+BOT_TZ          = config.BOT_TZ
+PHASE_END_MESSAGES = config.PHASE_END_MESSAGES
+GENERIC_REMINDER   = config.GENERIC_REMINDER
 
 intents = discord.Intents.default()
 intents.members = True
@@ -41,152 +41,13 @@ tree = bot.tree
 is_running = False
 pending_timer: asyncio.Task | None = None
 running_task: asyncio.Task | None = None
+_startup_recovery_done = False  # verhindert Re-Trigger bei Gateway-Reconnects
+# Zwischenspeicher für die Phasenend-Nachprüfung (siehe handle_phase_end):
+# der zuletzt per /tbreminder_platoons_check geprüfte Planet dieser Phase,
+# zurückgesetzt bei jedem neuen Phasenübergang in run_sequence.
+_last_checked_planet: str | None = None
 
-
-# stats.json structure:
-# {
-#   "total_tbs": 3,
-#   "current_run": {                    <- written at TB start, updated each phase, cleared on finish
-#     "active": true,
-#     "tb_index": 2,
-#     "phase": 4,                       <- last phase that completed (0 = none yet)
-#     "phase_started_at": 1712345678,   <- unix timestamp when current phase wait began
-#     "channel_id": 1279533599653232739
-#   },
-#   "players": {
-#     "<user_id>": {
-#       "name": "Spielername",
-#       "total_reminders": 7,
-#       "total_failed": 2,
-#       "total_tbs": 3,
-#       "tb_history": [2, 0, 3],
-#       "failed_history": [1, 0, 1]
-#     }
-#   }
-# }
-
-def load_stats() -> dict:
-    if os.path.exists(STATS_FILE):
-        with open(STATS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"total_tbs": 0, "players": {}}
-
-
-def save_stats(stats: dict):
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
-
-
-def get_tb_index(stats: dict) -> int:
-    """Current TB index = number of Territory Battles started so far."""
-    return stats.get("total_tbs", 0)
-
-
-def set_current_run(stats: dict, tb_index: int, phase: int, channel_id: int, update_timestamp: bool = True):
-    """
-    Persist the current run state to disk.
-    update_timestamp=True  -> fresh phase transition, write new phase_started_at
-    update_timestamp=False -> resume only, preserve existing phase_started_at
-    """
-    existing = stats.get("current_run", {})
-    stats["current_run"] = {
-        "active": True,
-        "tb_index": tb_index,
-        "phase": phase,
-        "phase_started_at": int(time.time()) if update_timestamp else existing.get("phase_started_at", int(time.time())),
-        "channel_id": channel_id,
-    }
-    save_stats(stats)
-
-
-def clear_current_run(stats: dict):
-    """Called when a TB sequence completes normally."""
-    stats["current_run"] = {"active": False}
-    save_stats(stats)
-
-
-def record_participation(stats: dict, members: list[discord.Member]):
-    """
-    Called once at TB start. Registers all current role members as
-    participating in this Territory Battle and increments the global TB counter.
-    """
-    tb_index = get_tb_index(stats)
-
-    for m in members:
-        uid = str(m.id)
-        if uid not in stats["players"]:
-            stats["players"][uid] = {
-                "name": m.display_name,
-                "total_reminders": 0,
-                "total_failed": 0,
-                "total_tbs": 0,
-                "tb_history": [],
-                "failed_history": [],
-            }
-        player = stats["players"][uid]
-        player["name"] = m.display_name
-
-        while len(player["tb_history"]) < tb_index:
-            player["tb_history"].append(0)
-        while len(player.setdefault("failed_history", [])) < tb_index:
-            player["failed_history"].append(0)
-
-        player["tb_history"].append(0)
-        player["failed_history"].append(0)
-        player["total_tbs"] += 1
-
-    stats["total_tbs"] = tb_index + 1
-    save_stats(stats)
-
-
-def record_reminders(stats: dict, reminded_members: list[tuple[str, str]], tb_index: int):
-    """Increment reminder count for each player the officer picked."""
-    for uid, name in reminded_members:
-        if uid not in stats["players"]:
-            stats["players"][uid] = {
-                "name": name,
-                "total_reminders": 0,
-                "total_failed": 0,
-                "total_tbs": 1,
-                "tb_history": [0] * (tb_index + 1),
-                "failed_history": [0] * (tb_index + 1),
-            }
-        player = stats["players"][uid]
-        player["name"] = name
-
-        while len(player["tb_history"]) <= tb_index:
-            player["tb_history"].append(0)
-
-        player["tb_history"][tb_index] += 1
-        player["total_reminders"] += 1
-
-    save_stats(stats)
-
-
-def record_failed(stats: dict, failed_members: list[tuple[str, str]], tb_index: int):
-    """Increment failed-to-set count for each player the officer flagged."""
-    for uid, name in failed_members:
-        if uid not in stats["players"]:
-            stats["players"][uid] = {
-                "name": name,
-                "total_reminders": 0,
-                "total_failed": 0,
-                "total_tbs": 1,
-                "tb_history": [0] * (tb_index + 1),
-                "failed_history": [0] * (tb_index + 1),
-            }
-        player = stats["players"][uid]
-        player["name"] = name
-        player.setdefault("total_failed", 0)
-        player.setdefault("failed_history", [])
-
-        while len(player["failed_history"]) <= tb_index:
-            player["failed_history"].append(0)
-
-        player["failed_history"][tb_index] += 1
-        player["total_failed"] = player.get("total_failed", 0) + 1
-
-    save_stats(stats)
+# stats.json-Struktur und alle Buchhaltungsfunktionen: siehe stats.py.
 
 
 # ── Permission helper ─────────────────────────────────────────────────────────
@@ -507,6 +368,26 @@ async def handle_phase_end(
             f"Erledigt! **{sent}** Spieler wurden per DM benachrichtigt" +
             (f", **{failed_dm}** konnten nicht erreicht werden (DMs deaktiviert)." if failed_dm else ".")
         )
+
+        # ── Platoon-Nachprüfung gegen die Erinnerungsauswahl ───────────────
+        # Wenn während dieser Phase /tbreminder_platoons_check gelaufen ist
+        # (siehe _last_checked_planet, gesetzt dort, zurückgesetzt am Anfang
+        # jeder neuen Phase in run_sequence), wird hier automatisch
+        # nachgeprüft, wie viele der ursprünglich verfügbaren Besitzer auch
+        # tatsächlich in der gerade getroffenen Erinnerungsauswahl stecken --
+        # kein separater Befehl nötig, Byproduct des DM-Schritts oben.
+        if _last_checked_planet:
+            reminded_ids = {uid for uid, _ in reminded}
+            try:
+                refined = requirements.compute_shortfall(_last_checked_planet)
+            except roster_read.RosterUnavailableError as e:
+                print(f"Platoon-Nachprüfung übersprungen (Roster nicht erreichbar): {e}")
+            else:
+                refinement_text = format_platoon_refinement(
+                    _last_checked_planet, refined, reminded_ids
+                )
+                for chunk in split_message(refinement_text):
+                    await officer.send(chunk)
     else:
         reason = "Uebersprungen" if reminder_view._skipped else "Timeout"
         print(f"Phase {phase_num}: {reason} - generische Nachricht wird gesendet.")
@@ -690,7 +571,7 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
     start_phase:    phase index (0-5) to start from. Used by /resume_tb.
     phase_elapsed:  seconds already elapsed in the current phase wait. Used by /resume_tb.
     """
-    global is_running
+    global is_running, _last_checked_planet
     stats = load_stats()
 
     # On resume, reuse the persisted tb_index. On fresh start, derive from record_participation.
@@ -729,6 +610,12 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
 
         carry_over = 0.0
         for i in range(start_phase, 6):
+            # Neue Wartezeit, neue Phase -- ein zuvor gecachter
+            # /tbreminder_platoons_check gehört zur vorherigen Phase und
+            # darf hier nicht mehr als "aktuell" gelten (siehe
+            # handle_phase_end's Nachprüfung unten).
+            _last_checked_planet = None
+
             if i == start_phase and phase_elapsed > 0:
                 # Resume: subtract already-elapsed time from this phase's wait
                 base_wait = 22 * HOURS if i == 0 else 24 * HOURS
@@ -760,37 +647,161 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
 
     except Exception as e:
         print(f"Unerwarteter Fehler: {e}")
+        await notify_failure(e)
         raise
     finally:
         is_running = False
+
+
+# ── Zuverlässigkeit: Task-Überwachung & Crash-Benachrichtigung ─────────────────
+
+async def notify_failure(exc: Exception):
+    """
+    Wird aufgerufen, wenn run_sequence mit einer unbehandelten Exception
+    abbricht -- egal ob das den Bot-Prozess selbst mit reißt oder nicht.
+    Ohne das: die Exception verschwindet in den Container-Logs (asyncio
+    protokolliert "exception was never retrieved" höchstens beim nächsten
+    Garbage-Collect), und in Discord passiert schlicht nichts mehr -- der
+    Officer merkt das erst, wenn die erwartete DM ausbleibt.
+
+    Best effort: schlägt sowohl der Kanal-Post als auch die Officer-DM
+    fehl (z.B. weil der Discord-Gateway selbst die Ursache der Exception
+    war), wird das geloggt, aber nichts weiter unternommen -- es gibt
+    keinen zuverlässigeren Kanal mehr, über den der Bot sich melden könnte.
+    """
+    tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(f"TB-Sequenz abgestürzt:\n{tb_text}")
+
+    message = (
+        f"❌ Die TB-Sequenz ist mit einem Fehler abgebrochen: `{exc}`\n"
+        f"Der Bot läuft weiter, die Sequenz nicht mehr. Bitte `/tbreminder_status` "
+        f"prüfen und ggf. `/tbreminder_resume` nutzen."
+    )
+    try:
+        channel = bot.get_channel(TW_CHANNEL_ID)
+        if channel:
+            await channel.send(message)
+    except Exception as notify_exc:
+        print(f"Konnte Absturz nicht im Kanal melden: {notify_exc}")
+
+    try:
+        officer = await bot.fetch_user(OFFICER_ID)
+        await officer.send(message)
+    except Exception as notify_exc:
+        print(f"Konnte Absturz nicht per DM an Officer melden: {notify_exc}")
+
+
+def launch_run_sequence(*args, **kwargs) -> asyncio.Task:
+    """
+    Einziger Erzeugungspunkt für die run_sequence-Task -- ersetzt die
+    bisher drei separaten asyncio.create_task(run_sequence(...))-Aufrufe
+    (Start, Timer, Resume). run_sequence fängt seine eigenen Exceptions
+    bereits ab und meldet sie über notify_failure() (siehe oben); dieser
+    zusätzliche add_done_callback ist die zweite Sicherheitsebene für den
+    Fall, dass eine Exception die Sequenz VOR dem try-Block verlässt, oder
+    dass die Task extern gecancelt statt regulär beendet wird (kein
+    Alarmfall, wird hier bewusst ignoriert).
+    """
+    task = asyncio.create_task(run_sequence(*args, **kwargs))
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            asyncio.create_task(notify_failure(exc))
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    guild = discord.Object(id=1269591429227745332)
+    global _startup_recovery_done, is_running, running_task
+
+    guild = discord.Object(id=GUILD_ID)
     tree.clear_commands(guild=guild)
     await tree.sync(guild=guild)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     print(f"Eingeloggt als {bot.user} (ID: {bot.user.id})")
+    print(f"   guild_id    : {GUILD_ID}")
     print(f"   tw_channel  : {TW_CHANNEL_ID}")
     print(f"   officer     : {OFFICER_ID}")
     print(f"   manager_ids : {MANAGER_IDS or '(keine)'}")
     print(f"   rolle       : {MEMBER_ROLE_ID}")
 
-    # Warn if an interrupted run is detected in stats.json
+    # on_ready kann bei Gateway-Reconnects mehrfach feuern -- die Recovery
+    # darf nur beim allerersten Verbindungsaufbau laufen, sonst würde ein
+    # normaler Reconnect während einer laufenden Sequenz fälschlich einen
+    # zweiten run_sequence-Task neben dem bereits laufenden starten.
+    if _startup_recovery_done:
+        return
+    _startup_recovery_done = True
+
     stats = load_stats()
     run = stats.get("current_run", {})
-    if run.get("active"):
-        phase = run.get("phase", 0)
-        elapsed = int(time.time()) - run.get("phase_started_at", int(time.time()))
+    if not run.get("active"):
+        return
+
+    phase = run.get("phase", 0)
+    started_at = run.get("phase_started_at")
+    channel_id = run.get("channel_id", TW_CHANNEL_ID)
+
+    if not started_at:
+        # Kein Zeitstempel vorhanden (z.B. sehr alte stats.json von vor
+        # dieser Funktion) -- Recovery kann die Wartezeit nicht berechnen,
+        # bleibt beim reinen Log-Hinweis wie bisher. Manueller
+        # /tbreminder_resume mit explizitem hours_elapsed bleibt der Weg.
         print(
-            f"⚠️  Unterbrochener TB gefunden! "
-            f"Phase {phase} war zuletzt aktiv, ~{elapsed // 3600}h {(elapsed % 3600) // 60}min sind vergangen. "
-            f"Nutze /resume_tb zum Fortfahren."
+            f"⚠️  Unterbrochener TB gefunden (Phase {phase}), aber kein "
+            f"Zeitstempel gespeichert -- automatische Recovery nicht möglich. "
+            f"Bitte /tbreminder_resume mit explizitem hours_elapsed nutzen."
         )
+        return
+
+    elapsed = int(time.time()) - started_at
+    channel = bot.get_channel(channel_id)
+
+    print(
+        f"⚠️  Unterbrochener TB gefunden! Phase {phase} war zuletzt aktiv, "
+        f"~{elapsed // 3600}h {(elapsed % 3600) // 60}min sind vergangen. "
+        f"Sequenz wird automatisch ab Phase {phase + 1} fortgesetzt."
+    )
+
+    if channel is None:
+        print(f"Kanal {channel_id} nicht gefunden -- automatische Recovery abgebrochen.")
+        try:
+            officer = await bot.fetch_user(OFFICER_ID)
+            await officer.send(
+                f"⚠️ TB-Reminder wurde neu gestartet und hat eine unterbrochene Sequenz "
+                f"gefunden (Phase {phase}), konnte den TB-Kanal (`{channel_id}`) aber "
+                f"nicht finden. Bitte `/tbreminder_resume` manuell ausführen."
+            )
+        except Exception as notify_exc:
+            print(f"Konnte Officer nicht benachrichtigen: {notify_exc}")
+        return
+
+    resume_message = (
+        f"⚠️ TB-Reminder wurde neu gestartet. Letzter bekannter Stand: "
+        f"Phase {phase}, ~{elapsed // 3600}h {(elapsed % 3600) // 60}min vergangen. "
+        f"Sequenz wird automatisch ab Phase {phase + 1} fortgesetzt."
+    )
+    try:
+        await channel.send(resume_message)
+    except Exception as notify_exc:
+        print(f"Konnte Kanal nicht benachrichtigen: {notify_exc}")
+
+    try:
+        officer = await bot.fetch_user(OFFICER_ID)
+        await officer.send(resume_message)
+    except Exception as notify_exc:
+        print(f"Konnte Officer nicht per DM benachrichtigen: {notify_exc}")
+
+    is_running = True
+    running_task = launch_run_sequence(channel, start_phase=phase, phase_elapsed=float(elapsed))
 
 
 @tree.command(name="tbreminder_start", description="Startet die Territory Battle Phasen-Ankuendigungen")
@@ -824,7 +835,7 @@ async def start(interaction: discord.Interaction):
     )
 
     is_running = True
-    running_task = asyncio.create_task(run_sequence(channel))
+    running_task = launch_run_sequence(channel)
 
 
 @tree.command(name="tbreminder_timer", description="Startet die TB-Sequenz automatisch zu einem bestimmten Zeitpunkt")
@@ -942,7 +953,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
             print("TB-Timer abgelaufen, aber Sequenz laeuft bereits - abgebrochen.")
             return
         is_running = True
-        running_task = asyncio.create_task(run_sequence(channel))
+        running_task = launch_run_sequence(channel)
 
     pending_timer = asyncio.create_task(delayed_start())
 
@@ -1005,7 +1016,7 @@ async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed:
     print(f"TB resume: Phase {phase}, {hours_elapsed:.2f}h vergangen, {remaining / HOURS:.2f}h verbleibend.")
 
     is_running = True
-    running_task = asyncio.create_task(run_sequence(channel, start_phase=phase_index, phase_elapsed=elapsed_seconds))
+    running_task = launch_run_sequence(channel, start_phase=phase_index, phase_elapsed=elapsed_seconds)
 
 
 @tree.command(name="tbreminder_results", description="Zeigt den TB-Abschlussbericht in diesem Kanal an")
@@ -1150,6 +1161,336 @@ async def tb_status(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+# ── Platoon-Feature: Anforderungen, Check, Ping ────────────────────────────────
+# Liest read-only aus TW-Counters counters.db (roster_read.py), Anforderungen
+# kommen aus einer einmal hochgeladenen CSV (requirements.py). Kein
+# Phasen-/Layout-Konzept -- siehe requirements.py-Docstring.
+
+
+async def planet_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        planets = requirements.get_planets()
+    except Exception as e:
+        print(f"Planet-Autocomplete fehlgeschlagen: {e}")
+        return []
+    return [
+        app_commands.Choice(name=p, value=p)
+        for p in planets
+        if current.lower() in p.lower()
+    ][:25]
+
+
+def format_platoon_report(planet: str, rows: list[dict]) -> str:
+    """Textausgabe für /tbreminder_platoons_check -- diagnostisch,
+    Verfügbar-/Fehlend-Aufschlüsselung pro Einheit, keine Buttons."""
+    lines = [f"📋 {planet} — Platoons\n"]
+    for row in rows:
+        marker = "⚠️" if row["shortfall"] > 0 else "✅"
+        lines.append(
+            f"{marker} {row['unit_name']} "
+            f"(benötigt Relic {row['required_relic']}, ×{row['required_count']})"
+        )
+        owners = row["owners"]
+        plural = "er" if len(owners) != 1 else ""
+        lines.append(
+            f"   Verfügbar: {len(owners)} Mitglied{plural} auf Relic {row['required_relic']}+"
+        )
+        if owners:
+            names = ", ".join(
+                f"{o['player_name']} (R{config.relic_tier_to_display(o['relic_tier'])})"
+                for o in owners
+            )
+            lines.append(f"   → {names}")
+        if row["shortfall"] > 0:
+            lines.append(f"   Fehlend: {row['shortfall']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def format_platoon_fill_report(planet: str, rows: list[dict]) -> str:
+    """Textausgabe für /tbreminder_platoons_ping -- Teilnahme-fokussiert,
+    (N fehlt)/(ausreichend) am Einheitennamen statt eines separaten
+    Verfügbar-Blocks. Die eigentlichen Ping-Buttons kommen von
+    PlatoonPingView, nicht von diesem Text."""
+    lines = [f"{planet} — Operation füllen\n"]
+    for row in rows:
+        status = f"({row['shortfall']} fehlt)" if row["shortfall"] > 0 else "(ausreichend)"
+        lines.append(f"{row['unit_name']} {status}")
+        owners = row["owners"]
+        if owners:
+            names = ", ".join(
+                f"{o['player_name']} (R{config.relic_tier_to_display(o['relic_tier'])})"
+                for o in owners
+            )
+            lines.append(f"   → {names}")
+        else:
+            lines.append("   → niemand verfügbar")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def format_platoon_refinement(planet: str, rows: list[dict], reminded_ids: set[str]) -> str:
+    """
+    Automatische Phasenend-Nachprüfung (siehe handle_phase_end): dieselben
+    Zeilen wie format_platoon_report(), aber gefiltert auf Besitzer, deren
+    discord_id in der gerade getroffenen Erinnerungsauswahl steckt --
+    "wer ist von den ursprünglich verfügbaren Besitzern auch tatsächlich
+    noch als aktiv markiert".
+    """
+    lines = [f"📋 {planet} — Nachgeprüft gegen deine Auswahl\n"]
+    for row in rows:
+        available = [o for o in row["owners"] if o["discord_id"] in reminded_ids]
+        marker = "⚠️" if len(available) < row["required_count"] else "✅"
+        if len(available) < row["required_count"]:
+            lines.append(
+                f"{marker} {row['unit_name']}: nur noch {len(available)} von "
+                f"{len(row['owners'])} verfügbaren Besitzern in deiner Auswahl"
+            )
+        else:
+            lines.append(f"{marker} {row['unit_name']}: weiterhin ausreichend gedeckt")
+    return "\n".join(lines).rstrip()
+
+
+class PlatoonPingView(discord.ui.View):
+    """
+    Ein Button pro Einheit mit Unterdeckung (shortfall > 0), plus ein
+    "Alle pingen"-Button für die Vereinigung aller gelisteten Einheiten
+    (auch gedeckte). Jeder Button ist genau einmal auslösbar -- danach
+    deaktiviert. Kein Tracking gegen Doppel-Pings über "Alle pingen"
+    hinweg (bewusst einfache Variante, siehe Chat-Verlauf). Kein
+    Officer-Timeout -- Ad-hoc-Aktion während einer laufenden Phase, kein
+    Teil der Phasen-State-Machine.
+    """
+
+    def __init__(self, planet: str, rows: list[dict]):
+        super().__init__(timeout=None)
+        self.planet = planet
+        self.rows = rows
+
+        for row in rows:
+            if row["shortfall"] > 0:
+                btn = discord.ui.Button(
+                    label=f"Für {row['unit_name']} pingen",
+                    style=discord.ButtonStyle.primary,
+                )
+                btn.callback = self._make_unit_callback(row, btn)
+                self.add_item(btn)
+
+        all_btn = discord.ui.Button(
+            label="Alle pingen", style=discord.ButtonStyle.success, row=4
+        )
+        all_btn.callback = self._on_ping_all
+        self.add_item(all_btn)
+
+    def _make_unit_callback(self, row: dict, btn: discord.ui.Button):
+        async def _callback(interaction: discord.Interaction):
+            mentions = [f"<@{o['discord_id']}>" for o in row["owners"] if o["discord_id"]]
+            if not mentions:
+                await interaction.response.send_message(
+                    f"Niemand mit registriertem Discord-Account besitzt "
+                    f"{row['unit_name']} auf ausreichendem Relic-Level.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                f"{' '.join(mentions)}\n"
+                f"Bitte für **{self.planet}** bereithalten (**{row['unit_name']}**)."
+            )
+            btn.disabled = True
+            await interaction.message.edit(view=self)
+
+        return _callback
+
+    async def _on_ping_all(self, interaction: discord.Interaction):
+        seen: set[str] = set()
+        mentions = []
+        for row in self.rows:
+            for o in row["owners"]:
+                if o["discord_id"] and o["discord_id"] not in seen:
+                    seen.add(o["discord_id"])
+                    mentions.append(f"<@{o['discord_id']}>")
+
+        if not mentions:
+            await interaction.response.send_message(
+                "Niemand mit registriertem Discord-Account gefunden.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"{' '.join(mentions)}\nBitte für **{self.planet}** bereithalten."
+        )
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        await interaction.message.edit(view=self)
+
+
+class ConfirmReplaceView(discord.ui.View):
+    """Bestätigungsdialog für /tbreminder_requirements_upload, wenn
+    bereits eine Anforderungsliste existiert -- analog zu ConfirmTimerView
+    oben. Destruktive Aktion (vollständiges Ersetzen), daher explizite
+    Bestätigung statt stillem Überschreiben."""
+
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.confirmed = False
+
+    @discord.ui.button(label="Ersetzen", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        await interaction.response.edit_message(content="Wird ersetzt...", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        await interaction.response.edit_message(content="Abgebrochen.", view=None)
+        self.stop()
+
+    async def on_timeout(self):
+        self.confirmed = False
+        try:
+            await self.message.edit(content="Keine Bestaetigung - Upload abgebrochen.", view=None)
+        except Exception:
+            pass
+
+
+@tree.command(
+    name="tbreminder_requirements_upload",
+    description="Lädt die Platoon-Anforderungsliste hoch (ersetzt eine bestehende vollständig)",
+)
+@app_commands.describe(
+    file="CSV mit Spalten: planet, unit_name, required_count, required_relic"
+)
+async def requirements_upload(interaction: discord.Interaction, file: discord.Attachment):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        raw = await file.read()
+    except Exception as e:
+        await interaction.followup.send(f"Konnte Datei nicht lesen: {e}", ephemeral=True)
+        return
+
+    try:
+        new_data = requirements.parse_csv(raw)
+    except requirements.RequirementsParseError as e:
+        await interaction.followup.send(f"CSV fehlerhaft:\n```\n{e}\n```", ephemeral=True)
+        return
+    except roster_read.RosterUnavailableError as e:
+        await interaction.followup.send(f"Rosterdaten nicht erreichbar: {e}", ephemeral=True)
+        return
+
+    total_new_rows = sum(len(v) for v in new_data.values())
+    existing = requirements.load_requirements()
+
+    if existing:
+        total_old_rows = sum(len(v) for v in existing.values())
+        view = ConfirmReplaceView()
+        await interaction.followup.send(
+            f"Es existiert bereits eine Anforderungsliste "
+            f"({len(existing)} Planeten, {total_old_rows} Zeilen). "
+            f"Mit der neuen Datei ersetzen ({len(new_data)} Planeten, "
+            f"{total_new_rows} Zeilen)?",
+            view=view,
+            ephemeral=True,
+        )
+        view.message = await interaction.original_response()
+        await view.wait()
+        if not view.confirmed:
+            return
+
+    backup_path = requirements.replace_requirements(new_data)
+    msg = f"✅ Anforderungsliste gespeichert: {len(new_data)} Planeten, {total_new_rows} Zeilen."
+    if backup_path:
+        msg += f"\nVorherige Version gesichert unter `{os.path.basename(backup_path)}`."
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@tree.command(
+    name="tbreminder_platoons_check",
+    description="Zeigt Fehlbestand pro Einheit für einen Planeten (diagnostisch, keine Ping-Buttons)",
+)
+@app_commands.describe(planet="Planet, wie in der Anforderungsliste hinterlegt")
+@app_commands.autocomplete(planet=planet_autocomplete)
+async def platoons_check(interaction: discord.Interaction, planet: str):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    rows = requirements.get_planet_requirements(planet)
+    if not rows:
+        await interaction.response.send_message(
+            f"Keine Anforderungen für Planet '{planet}' hinterlegt. "
+            f"Erst `/tbreminder_requirements_upload` ausführen.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    try:
+        shortfall_rows = requirements.compute_shortfall(planet)
+    except roster_read.RosterUnavailableError as e:
+        await interaction.followup.send(f"Rosterdaten nicht erreichbar: {e}")
+        return
+
+    global _last_checked_planet
+    _last_checked_planet = planet
+
+    text = format_platoon_report(planet, shortfall_rows)
+    for chunk in split_message(text):
+        await interaction.followup.send(chunk)
+
+
+@tree.command(
+    name="tbreminder_platoons_ping",
+    description="Ruft alle Besitzer der benötigten Einheiten eines Planeten zur Teilnahme auf",
+)
+@app_commands.describe(planet="Planet, wie in der Anforderungsliste hinterlegt")
+@app_commands.autocomplete(planet=planet_autocomplete)
+async def platoons_ping(interaction: discord.Interaction, planet: str):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    rows = requirements.get_planet_requirements(planet)
+    if not rows:
+        await interaction.response.send_message(
+            f"Keine Anforderungen für Planet '{planet}' hinterlegt. "
+            f"Erst `/tbreminder_requirements_upload` ausführen.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    try:
+        shortfall_rows = requirements.compute_shortfall(planet)
+    except roster_read.RosterUnavailableError as e:
+        await interaction.followup.send(f"Rosterdaten nicht erreichbar: {e}")
+        return
+
+    text = format_platoon_fill_report(planet, shortfall_rows)
+    view = PlatoonPingView(planet, shortfall_rows)
+    chunks = split_message(text)
+    for chunk in chunks[:-1]:
+        await interaction.followup.send(chunk)
+    await interaction.followup.send(chunks[-1], view=view)
+
+
 @tree.command(name="tbreminder_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
 async def help_command(interaction: discord.Interaction):
     help_text = (
@@ -1184,6 +1525,20 @@ async def help_command(interaction: discord.Interaction):
         "### ⛔ Abbrechen\n"
         "**`/tbreminder_cancel`**\n"
         "Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab.\n\n"
+
+        "### 🪖 Platoons\n"
+        "**`/tbreminder_requirements_upload file`**\n"
+        "Lädt die Platoon-Anforderungsliste hoch (CSV: planet, unit_name, "
+        "required_count, required_relic). Ersetzt eine bestehende Liste "
+        "vollständig, mit Bestätigung und automatischem Backup.\n\n"
+
+        "**`/tbreminder_platoons_check planet`**\n"
+        "Zeigt Fehlbestand pro Einheit für einen Planeten -- diagnostisch, "
+        "keine Ping-Buttons.\n\n"
+
+        "**`/tbreminder_platoons_ping planet`**\n"
+        "Ruft alle Besitzer der benötigten Einheiten zur Teilnahme auf, "
+        "mit einem Ping-Button pro Einheit plus 'Alle pingen'.\n\n"
 
         "### ℹ️ Sonstiges\n"
         "**`/tbreminder_help`**\n"

@@ -17,6 +17,10 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
--e 
-# Player reminder stats (persistent data, kept on server)
-stats.json
+
+# Runtime data (persistent, kept in DATA_DIR on the server). Whole
+# directory, not individual filenames -- stats.json, requirements/*.json,
+# and *.bak.json backups all live here, and enumerating them one at a
+# time is exactly how a stray file can slip through and get committed
+# (see TW-Counter's .gitignore for the precedent).
+data/
