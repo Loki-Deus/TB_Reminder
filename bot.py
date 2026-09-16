@@ -1243,31 +1243,6 @@ def format_platoon_report(planet: str, rows: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def format_platoon_fill_report(planet: str, rows: list[dict]) -> str:
-    """Textausgabe für /tbreminder_planets_ping -- Teilnahme-fokussiert,
-    (N fehlt)/(ausreichend) am Einheitennamen statt eines separaten
-    Verfügbar-Blocks. Die eigentlichen Ping-Buttons kommen von
-    PlatoonPingView, nicht von diesem Text.
-
-    Gleiches Prinzip wie format_platoon_report(): Namen nur bei
-    Unterdeckung auflisten. Der Ping-Button selbst pingt trotzdem ALLE
-    registrierten Besitzer (row["owners"] direkt, unabhängig von diesem
-    Text) -- nur die textuelle Vorschau wird gekürzt, nicht die
-    tatsächliche Ping-Funktionalität."""
-    lines = [f"{planet} — Operation füllen\n"]
-    for row in rows:
-        status = f"({row['shortfall']} fehlt)" if row["shortfall"] > 0 else "(ausreichend)"
-        lines.append(f"{row['unit_name']} {status}")
-        owners = row["owners"]
-        if row["shortfall"] > 0:
-            if owners:
-                lines.append(f"   → {_format_owner_names(row)}")
-            else:
-                lines.append("   → niemand verfügbar")
-        lines.append("")
-    return "\n".join(lines).rstrip()
-
-
 def format_platoon_refinement(planet: str, rows: list[dict], reminded_ids: set[str]) -> str:
     """
     Automatische Phasenend-Nachprüfung (siehe handle_phase_end): dieselben
@@ -1292,42 +1267,44 @@ def format_platoon_refinement(planet: str, rows: list[dict], reminded_ids: set[s
 
 class PlatoonPingView(discord.ui.View):
     """
-    Ein Button pro Einheit mit Unterdeckung (shortfall > 0), plus ein
-    "Alle pingen"-Button für die Vereinigung aller gelisteten Einheiten
-    (auch gedeckte). Jeder Button ist genau einmal auslösbar -- danach
-    deaktiviert. Kein Tracking gegen Doppel-Pings über "Alle pingen"
-    hinweg (bewusst einfache Variante, siehe Chat-Verlauf). Kein
-    Officer-Timeout -- Ad-hoc-Aktion während einer laufenden Phase, kein
-    Teil der Phasen-State-Machine.
+    Ein Button pro Einheit -- unabhängig vom Fehlbestand, auch bei voller
+    Deckung (live aufgefallen: die ursprüngliche "nur bei Unterdeckung"-
+    Variante ließ bei einem vollständig gedeckten Planeten gar keine
+    Einzel-Buttons mehr übrig, nur noch "Alle pingen", siehe Chat-Verlauf).
+    Jeder Button ist genau einmal auslösbar, danach deaktiviert. Kein
+    Officer-Timeout -- Ad-hoc-Aktion während einer laufenden Phase.
+
+    Trägt NUR Einzel-Buttons, kein "Alle pingen" mehr -- das sitzt jetzt
+    in AllUnitsPingView (siehe unten), als eigene, letzte Nachricht.
+    Grund: Discord erlaubt maximal 25 Komponenten pro Nachricht (5 Reihen
+    x 5), ROTE-Planeten haben aber 35-58 verschiedene Einheiten -- die
+    Einzel-Buttons müssen deshalb auf mehrere Nachrichten/View-Instanzen
+    verteilt werden (siehe planets_ping() unten), und "Alle pingen" muss
+    dafür unabhängig von einer bestimmten Buttons-Nachricht funktionieren,
+    nicht an eine einzelne von mehreren PlatoonPingView-Instanzen gebunden
+    sein.
     """
 
     def __init__(self, planet: str, rows: list[dict]):
         super().__init__(timeout=None)
         self.planet = planet
-        self.rows = rows
 
         for row in rows:
-            if row["shortfall"] > 0:
-                btn = discord.ui.Button(
-                    label=f"Für {row['unit_name']} pingen",
-                    style=discord.ButtonStyle.primary,
-                )
-                btn.callback = self._make_unit_callback(row, btn)
-                self.add_item(btn)
-
-        all_btn = discord.ui.Button(
-            label="Alle pingen", style=discord.ButtonStyle.success, row=4
-        )
-        all_btn.callback = self._on_ping_all
-        self.add_item(all_btn)
+            btn = discord.ui.Button(
+                label=f"Für {row['unit_name']} pingen",
+                style=discord.ButtonStyle.primary,
+            )
+            btn.callback = self._make_unit_callback(row, btn)
+            self.add_item(btn)
 
     def _make_unit_callback(self, row: dict, btn: discord.ui.Button):
         async def _callback(interaction: discord.Interaction):
             mentions = [f"<@{o['discord_id']}>" for o in row["owners"] if o["discord_id"]]
             if not mentions:
+                extra = "" if row.get("is_ship") else " auf ausreichendem Relic-Level"
                 await interaction.response.send_message(
                     f"Niemand mit registriertem Discord-Account besitzt "
-                    f"{row['unit_name']} auf ausreichendem Relic-Level.",
+                    f"{row['unit_name']}{extra}.",
                     ephemeral=True,
                 )
                 return
@@ -1340,10 +1317,27 @@ class PlatoonPingView(discord.ui.View):
 
         return _callback
 
-    async def _on_ping_all(self, interaction: discord.Interaction):
+
+class AllUnitsPingView(discord.ui.View):
+    """
+    Eigenständige, einzelne "Alle pingen"-Schaltfläche -- pingt die
+    Vereinigung aller registrierten Besitzer über ALLE Zeilen eines
+    Planeten, unabhängig davon, auf wie viele PlatoonPingView-Nachrichten
+    die Einzel-Buttons verteilt sind (siehe dortige Docstring). Kein
+    Tracking gegen Doppel-Pings über die Einzel-Buttons hinweg (bewusst
+    einfache Variante, siehe Chat-Verlauf).
+    """
+
+    def __init__(self, planet: str, all_rows: list[dict]):
+        super().__init__(timeout=None)
+        self.planet = planet
+        self.all_rows = all_rows
+
+    @discord.ui.button(label="Alle pingen", style=discord.ButtonStyle.success)
+    async def ping_all(self, interaction: discord.Interaction, button: discord.ui.Button):
         seen: set[str] = set()
         mentions = []
-        for row in self.rows:
+        for row in self.all_rows:
             for o in row["owners"]:
                 if o["discord_id"] and o["discord_id"] not in seen:
                     seen.add(o["discord_id"])
@@ -1358,9 +1352,7 @@ class PlatoonPingView(discord.ui.View):
         await interaction.response.send_message(
             f"{' '.join(mentions)}\nBitte für **{self.planet}** bereithalten."
         )
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
+        button.disabled = True
         await interaction.message.edit(view=self)
 
 
@@ -1553,12 +1545,33 @@ async def planets_ping(interaction: discord.Interaction, planet: str):
         await interaction.followup.send(f"Rosterdaten nicht erreichbar: {e}")
         return
 
-    text = format_platoon_fill_report(planet, shortfall_rows)
-    view = PlatoonPingView(planet, shortfall_rows)
-    chunks = split_message(text)
-    for chunk in chunks[:-1]:
+    # Gleicher Text wie /tbreminder_planets_check -- der ausschlaggebende
+    # Unterschied zu vorher, siehe Chat-Verlauf: der Officer wollte die
+    # vertraute Verfügbar-/Fehlend-Ansicht, nicht die kompakte
+    # (N fehlt)/(ausreichend)-Variante, nur eben zusätzlich mit
+    # Ping-Buttons.
+    text = format_platoon_report(planet, shortfall_rows)
+    for chunk in split_message(text):
         await interaction.followup.send(chunk)
-    await interaction.followup.send(chunks[-1], view=view)
+
+    # Ping-Buttons getrennt von der Textausgabe verschickt, in Gruppen zu
+    # maximal 25 (Discords Hartlimit pro Nachricht) -- ein Planet mit
+    # vielen Einheiten (ROTE: 35-58) sprengt das in einer einzigen
+    # Nachricht locker. "Alle pingen" kommt am Ende als eigene, letzte
+    # Nachricht, unabhängig davon, wie viele Einzel-Buttons-Nachrichten
+    # davor stehen -- siehe AllUnitsPingView-Docstring.
+    DISCORD_MAX_COMPONENTS = 25
+    total = len(shortfall_rows)
+    for i in range(0, total, DISCORD_MAX_COMPONENTS):
+        chunk_rows = shortfall_rows[i:i + DISCORD_MAX_COMPONENTS]
+        view = PlatoonPingView(planet, chunk_rows)
+        label = f"Ping-Buttons ({i + 1}–{i + len(chunk_rows)} von {total}):"
+        await interaction.followup.send(label, view=view)
+
+    await interaction.followup.send(
+        "Oder alle Besitzer aller gelisteten Einheiten auf einmal pingen:",
+        view=AllUnitsPingView(planet, shortfall_rows),
+    )
 
 
 async def _lookup_unit(unit: str, relic: int):
