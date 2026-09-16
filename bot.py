@@ -1265,6 +1265,43 @@ def format_platoon_refinement(planet: str, rows: list[dict], reminded_ids: set[s
     return "\n".join(lines).rstrip()
 
 
+def _build_ping_content(context_line: str, owners: list) -> str | None:
+    """
+    Gemeinsamer Ping-Text-Baustein für alle drei Ping-Views. Registrierte
+    Besitzer (discord_id vorhanden, via /tw_register) werden als
+    @mentions gepingt; nicht-registrierte werden als Klartext-Namen
+    aufgeführt, statt stillschweigend aus der Ping-Nachricht zu
+    verschwinden -- vorher wurden sie komplett ausgeblendet, wenn
+    mindestens ein anderer Besitzer registriert war (live aufgefallen,
+    siehe Chat-Verlauf: nicht jedes Gildenmitglied hat /tw_register schon
+    ausgeführt).
+
+    Gibt None zurück, wenn owners komplett leer ist -- der Aufrufer zeigt
+    dann seine eigene "niemand besitzt"-Meldung statt eines leeren Pings.
+    Ein Ergebnis mit nur nicht-registrierten Namen (keine @mentions) ist
+    dagegen ein gültiger, nicht-leerer Ping-Text.
+    """
+    if not owners:
+        return None
+
+    mentions = [f"<@{o['discord_id']}>" for o in owners if o["discord_id"]]
+    # Namensbasierte Deduplizierung -- roster_read.get_owners_of_unit()
+    # liefert keine ally_code-Spalte zurück, daher kein exakterer
+    # Schlüssel verfügbar. Restrisiko: zwei Gildenmitglieder mit
+    # identischem Ingame-Namen würden hier fälschlich zusammengelegt --
+    # in der Praxis selten genug, um für diesen Zweck (wer muss manuell
+    # informiert werden) hinnehmbar zu sein.
+    unregistered = sorted({o["player_name"] for o in owners if not o["discord_id"]})
+
+    parts = []
+    if mentions:
+        parts.append(" ".join(mentions))
+    if unregistered:
+        parts.append(f"Nicht registriert, bitte manuell informieren: {', '.join(unregistered)}")
+    parts.append(context_line)
+    return "\n".join(parts)
+
+
 class PlatoonPingView(discord.ui.View):
     """
     Ein Button pro Einheit -- unabhängig vom Fehlbestand, auch bei voller
@@ -1291,7 +1328,7 @@ class PlatoonPingView(discord.ui.View):
 
         for row in rows:
             btn = discord.ui.Button(
-                label=f"Für {row['unit_name']} pingen",
+                label=f"{row['unit_name']} pingen",
                 style=discord.ButtonStyle.primary,
             )
             btn.callback = self._make_unit_callback(row, btn)
@@ -1299,19 +1336,14 @@ class PlatoonPingView(discord.ui.View):
 
     def _make_unit_callback(self, row: dict, btn: discord.ui.Button):
         async def _callback(interaction: discord.Interaction):
-            mentions = [f"<@{o['discord_id']}>" for o in row["owners"] if o["discord_id"]]
-            if not mentions:
-                extra = "" if row.get("is_ship") else " auf ausreichendem Relic-Level"
+            context_line = f"Bitte für **{self.planet}** bereithalten (**{row['unit_name']}**)."
+            content = _build_ping_content(context_line, row["owners"])
+            if content is None:
                 await interaction.response.send_message(
-                    f"Niemand mit registriertem Discord-Account besitzt "
-                    f"{row['unit_name']}{extra}.",
-                    ephemeral=True,
+                    f"Niemand besitzt {row['unit_name']}.", ephemeral=True
                 )
                 return
-            await interaction.response.send_message(
-                f"{' '.join(mentions)}\n"
-                f"Bitte für **{self.planet}** bereithalten (**{row['unit_name']}**)."
-            )
+            await interaction.response.send_message(content)
             btn.disabled = True
             await interaction.message.edit(view=self)
 
@@ -1335,23 +1367,28 @@ class AllUnitsPingView(discord.ui.View):
 
     @discord.ui.button(label="Alle pingen", style=discord.ButtonStyle.success)
     async def ping_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        seen: set[str] = set()
-        mentions = []
+        seen_ids: set[str] = set()
+        seen_names: set[str] = set()
+        deduped_owners = []
         for row in self.all_rows:
             for o in row["owners"]:
-                if o["discord_id"] and o["discord_id"] not in seen:
-                    seen.add(o["discord_id"])
-                    mentions.append(f"<@{o['discord_id']}>")
+                if o["discord_id"]:
+                    if o["discord_id"] not in seen_ids:
+                        seen_ids.add(o["discord_id"])
+                        deduped_owners.append(o)
+                elif o["player_name"] not in seen_names:
+                    seen_names.add(o["player_name"])
+                    deduped_owners.append(o)
 
-        if not mentions:
+        context_line = f"Bitte für **{self.planet}** bereithalten."
+        content = _build_ping_content(context_line, deduped_owners)
+        if content is None:
             await interaction.response.send_message(
-                "Niemand mit registriertem Discord-Account gefunden.", ephemeral=True
+                "Niemand besitzt eine der gelisteten Einheiten.", ephemeral=True
             )
             return
 
-        await interaction.response.send_message(
-            f"{' '.join(mentions)}\nBitte für **{self.planet}** bereithalten."
-        )
+        await interaction.response.send_message(content)
         button.disabled = True
         await interaction.message.edit(view=self)
 
@@ -1372,17 +1409,14 @@ class UnitPingView(discord.ui.View):
 
     @discord.ui.button(label="Pingen", style=discord.ButtonStyle.primary)
     async def ping(self, interaction: discord.Interaction, button: discord.ui.Button):
-        mentions = [f"<@{o['discord_id']}>" for o in self.owners if o["discord_id"]]
-        if not mentions:
+        context_line = f"Bitte für **{self.unit_name}** bereithalten."
+        content = _build_ping_content(context_line, self.owners)
+        if content is None:
             await interaction.response.send_message(
-                f"Niemand mit registriertem Discord-Account besitzt "
-                f"{self.unit_name}" + ("" if self.is_ship else " auf ausreichendem Relic-Level") + ".",
-                ephemeral=True,
+                f"Niemand besitzt {self.unit_name}.", ephemeral=True
             )
             return
-        await interaction.response.send_message(
-            f"{' '.join(mentions)}\nBitte für **{self.unit_name}** bereithalten."
-        )
+        await interaction.response.send_message(content)
         button.disabled = True
         await interaction.message.edit(view=self)
 
