@@ -6,7 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code
-COPY bot.py .
+# Copy bot code -- ALL modules, not just bot.py. config.py, stats.py,
+# roster_read.py and requirements.py are separate modules bot.py imports
+# at startup; shipping only bot.py crashes immediately on import.
+COPY *.py .
 
 CMD ["python", "-u", "bot.py"]
