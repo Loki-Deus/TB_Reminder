@@ -83,6 +83,30 @@ def resolve_unit_id(display_name: str) -> str | None:
         return row["unit_id"] if row else None
 
 
+def get_owned_unit_display_names() -> list[str]:
+    """
+    Alle Anzeigenamen, die mindestens ein Gildenmitglied laut letztem
+    Roster-Refresh tatsächlich besitzt -- Quelle für die Autocomplete von
+    /tbreminder_units_ping. Exakt dasselbe Prinzip wie TW-Counters eigene
+    Charakter-Katalog-Autocomplete (db.get_owned_unit_display_names(),
+    siehe dessen README-Abschnitt "Charakter-Katalog"): kein
+    ungefilterter ~11.000-Einheiten-Katalog, nur was die Gilde wirklich
+    hat.
+    """
+    with get_connection() as conn:
+        return [
+            row["display_name"]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT n.display_name
+                FROM unit_names n
+                JOIN roster_units r ON r.unit_id = n.unit_id
+                ORDER BY n.display_name
+                """
+            ).fetchall()
+        ]
+
+
 def get_owners_of_unit(unit_id: str, min_raw_relic_tier: int) -> list[sqlite3.Row]:
     """
     Gildenmitglieder, die eine bestimmte Einheit auf mindestens

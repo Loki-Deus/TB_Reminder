@@ -43,7 +43,7 @@ pending_timer: asyncio.Task | None = None
 running_task: asyncio.Task | None = None
 _startup_recovery_done = False  # verhindert Re-Trigger bei Gateway-Reconnects
 # Zwischenspeicher für die Phasenend-Nachprüfung (siehe handle_phase_end):
-# der zuletzt per /tbreminder_platoons_check geprüfte Planet dieser Phase,
+# der zuletzt per /tbreminder_planets_check geprüfte Planet dieser Phase,
 # zurückgesetzt bei jedem neuen Phasenübergang in run_sequence.
 _last_checked_planet: str | None = None
 
@@ -370,7 +370,7 @@ async def handle_phase_end(
         )
 
         # ── Platoon-Nachprüfung gegen die Erinnerungsauswahl ───────────────
-        # Wenn während dieser Phase /tbreminder_platoons_check gelaufen ist
+        # Wenn während dieser Phase /tbreminder_planets_check gelaufen ist
         # (siehe _last_checked_planet, gesetzt dort, zurückgesetzt am Anfang
         # jeder neuen Phase in run_sequence), wird hier automatisch
         # nachgeprüft, wie viele der ursprünglich verfügbaren Besitzer auch
@@ -611,7 +611,7 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
         carry_over = 0.0
         for i in range(start_phase, 6):
             # Neue Wartezeit, neue Phase -- ein zuvor gecachter
-            # /tbreminder_platoons_check gehört zur vorherigen Phase und
+            # /tbreminder_planets_check gehört zur vorherigen Phase und
             # darf hier nicht mehr als "aktuell" gelten (siehe
             # handle_phase_end's Nachprüfung unten).
             _last_checked_planet = None
@@ -1180,6 +1180,22 @@ async def planet_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
+async def unit_autocomplete(interaction: discord.Interaction, current: str):
+    """Für /tbreminder_units_ping -- nicht an die Anforderungsliste
+    gebunden, sondern an alles, was mindestens ein Gildenmitglied laut
+    Roster tatsächlich besitzt (siehe roster_read.get_owned_unit_display_names())."""
+    try:
+        names = roster_read.get_owned_unit_display_names()
+    except roster_read.RosterUnavailableError as e:
+        print(f"Unit-Autocomplete fehlgeschlagen: {e}")
+        return []
+    return [
+        app_commands.Choice(name=n, value=n)
+        for n in names
+        if current.lower() in n.lower()
+    ][:25]
+
+
 def _format_owner_names(row: dict) -> str:
     """Gemeinsame Besitzer-Namensformatierung für beide Platoon-Textausgaben.
     Bei Schiffen wird kein '(RX)' angehängt -- relic_tier ist dort immer
@@ -1194,7 +1210,7 @@ def _format_owner_names(row: dict) -> str:
 
 
 def format_platoon_report(planet: str, rows: list[dict]) -> str:
-    """Textausgabe für /tbreminder_platoons_check -- diagnostisch,
+    """Textausgabe für /tbreminder_planets_check -- diagnostisch,
     Verfügbar-/Fehlend-Aufschlüsselung pro Einheit, keine Buttons.
 
     Namen der Besitzer werden NUR bei tatsächlicher Unterdeckung
@@ -1228,7 +1244,7 @@ def format_platoon_report(planet: str, rows: list[dict]) -> str:
 
 
 def format_platoon_fill_report(planet: str, rows: list[dict]) -> str:
-    """Textausgabe für /tbreminder_platoons_ping -- Teilnahme-fokussiert,
+    """Textausgabe für /tbreminder_planets_ping -- Teilnahme-fokussiert,
     (N fehlt)/(ausreichend) am Einheitennamen statt eines separaten
     Verfügbar-Blocks. Die eigentlichen Ping-Buttons kommen von
     PlatoonPingView, nicht von diesem Text.
@@ -1348,6 +1364,37 @@ class PlatoonPingView(discord.ui.View):
         await interaction.message.edit(view=self)
 
 
+class UnitPingView(discord.ui.View):
+    """
+    Einzelner Ping-Button für /tbreminder_units_ping -- ad-hoc, eine
+    Einheit, ein Ergebnis. Einfacher als PlatoonPingView (kein
+    "Alle pingen" nötig, da es nur eine Einheit gibt), gleiches
+    Prinzip: einmalig auslösbar, kein Officer-Timeout.
+    """
+
+    def __init__(self, unit_name: str, owners: list, is_ship: bool):
+        super().__init__(timeout=None)
+        self.unit_name = unit_name
+        self.owners = owners
+        self.is_ship = is_ship
+
+    @discord.ui.button(label="Pingen", style=discord.ButtonStyle.primary)
+    async def ping(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mentions = [f"<@{o['discord_id']}>" for o in self.owners if o["discord_id"]]
+        if not mentions:
+            await interaction.response.send_message(
+                f"Niemand mit registriertem Discord-Account besitzt "
+                f"{self.unit_name}" + ("" if self.is_ship else " auf ausreichendem Relic-Level") + ".",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"{' '.join(mentions)}\nBitte für **{self.unit_name}** bereithalten."
+        )
+        button.disabled = True
+        await interaction.message.edit(view=self)
+
+
 class ConfirmReplaceView(discord.ui.View):
     """Bestätigungsdialog für /tbreminder_requirements_upload, wenn
     bereits eine Anforderungsliste existiert -- analog zu ConfirmTimerView
@@ -1437,12 +1484,12 @@ async def requirements_upload(interaction: discord.Interaction, file: discord.At
 
 
 @tree.command(
-    name="tbreminder_platoons_check",
+    name="tbreminder_planets_check",
     description="Zeigt Fehlbestand pro Einheit für einen Planeten (diagnostisch, keine Ping-Buttons)",
 )
 @app_commands.describe(planet="Planet, wie in der Anforderungsliste hinterlegt")
 @app_commands.autocomplete(planet=planet_autocomplete)
-async def platoons_check(interaction: discord.Interaction, planet: str):
+async def planets_check(interaction: discord.Interaction, planet: str):
     if not is_authorized(interaction):
         await interaction.response.send_message(
             "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
@@ -1476,12 +1523,12 @@ async def platoons_check(interaction: discord.Interaction, planet: str):
 
 
 @tree.command(
-    name="tbreminder_platoons_ping",
+    name="tbreminder_planets_ping",
     description="Ruft alle Besitzer der benötigten Einheiten eines Planeten zur Teilnahme auf",
 )
 @app_commands.describe(planet="Planet, wie in der Anforderungsliste hinterlegt")
 @app_commands.autocomplete(planet=planet_autocomplete)
-async def platoons_ping(interaction: discord.Interaction, planet: str):
+async def planets_ping(interaction: discord.Interaction, planet: str):
     if not is_authorized(interaction):
         await interaction.response.send_message(
             "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
@@ -1512,6 +1559,114 @@ async def platoons_ping(interaction: discord.Interaction, planet: str):
     for chunk in chunks[:-1]:
         await interaction.followup.send(chunk)
     await interaction.followup.send(chunks[-1], view=view)
+
+
+async def _lookup_unit(unit: str, relic: int):
+    """
+    Gemeinsame Auflösungs-/Abfragelogik für /tbreminder_units_check und
+    /tbreminder_units_ping -- beide brauchen exakt dasselbe (Einheit
+    auflösen, Schiff erkennen, Besitzer abfragen, Anzeige-Zeilen bauen),
+    nur der Ping-Button unterscheidet sie. Eine Funktion statt zweier
+    Kopien, damit sich das Verhalten nicht auseinanderentwickeln kann.
+
+    Rückgabe: (lines, owners, is_ship) bei Erfolg, oder (error_text, None,
+    None) wenn die Einheit nicht aufgelöst werden konnte oder die
+    Rosterdaten nicht erreichbar sind -- der Aufrufer unterscheidet das
+    am zweiten Rückgabewert (owners is None -> error_text direkt senden).
+    """
+    try:
+        unit_id = roster_read.resolve_unit_id(unit)
+    except roster_read.RosterUnavailableError as e:
+        return f"Rosterdaten nicht erreichbar: {e}", None, None
+
+    if unit_id is None:
+        return (
+            f"'{unit}' konnte nicht aufgelöst werden -- besitzt sie laut "
+            f"letztem Roster-Refresh mindestens ein Gildenmitglied?"
+        ), None, None
+
+    is_ship = unit in requirements.SHIP_UNIT_NAMES
+    if is_ship:
+        owners = roster_read.get_owners_of_unit_ignore_relic(unit_id)
+    else:
+        owners = roster_read.get_owners_of_unit(unit_id, config.display_relic_to_raw(relic))
+
+    lines = [f"🔍 {unit}"]
+    plural = "er" if len(owners) != 1 else ""
+    if is_ship:
+        if relic:
+            lines.append("(Relic-Angabe ignoriert -- Schiffe haben kein Relic-System)")
+        lines.append(f"Verfügbar: {len(owners)} Mitglied{plural}")
+    else:
+        lines.append(f"Verfügbar: {len(owners)} Mitglied{plural} auf Relic {relic}+")
+    if owners:
+        fake_row = {"is_ship": is_ship, "owners": owners}
+        lines.append(f"→ {_format_owner_names(fake_row)}")
+
+    return lines, owners, is_ship
+
+
+@tree.command(
+    name="tbreminder_units_check",
+    description="Zeigt alle Besitzer einer bestimmten Einheit auf einem Relic-Level (diagnostisch, keine Ping-Buttons)",
+)
+@app_commands.describe(
+    unit="Einheit (nur was mindestens ein Gildenmitglied laut Roster besitzt)",
+    relic="Mindest-Relic-Level (0-20). Wird für Schiffe ignoriert, da diese kein Relic-System haben.",
+)
+@app_commands.autocomplete(unit=unit_autocomplete)
+async def units_check(
+    interaction: discord.Interaction,
+    unit: str,
+    relic: app_commands.Range[int, 0, 20] = 0,
+):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    lines, owners, is_ship = await _lookup_unit(unit, relic)
+    if owners is None:
+        await interaction.followup.send(lines)  # lines is the error text here
+        return
+
+    await interaction.followup.send("\n".join(lines))
+
+
+@tree.command(
+    name="tbreminder_units_ping",
+    description="Zeigt und pingt alle Besitzer einer bestimmten Einheit auf einem Relic-Level -- unabhängig von der Anforderungsliste",
+)
+@app_commands.describe(
+    unit="Einheit (nur was mindestens ein Gildenmitglied laut Roster besitzt)",
+    relic="Mindest-Relic-Level (0-20). Wird für Schiffe ignoriert, da diese kein Relic-System haben.",
+)
+@app_commands.autocomplete(unit=unit_autocomplete)
+async def units_ping(
+    interaction: discord.Interaction,
+    unit: str,
+    relic: app_commands.Range[int, 0, 20] = 0,
+):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    lines, owners, is_ship = await _lookup_unit(unit, relic)
+    if owners is None:
+        await interaction.followup.send(lines)  # lines is the error text here
+        return
+
+    view = UnitPingView(unit, owners, is_ship)
+    await interaction.followup.send("\n".join(lines), view=view)
 
 
 @tree.command(name="tbreminder_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
@@ -1555,13 +1710,22 @@ async def help_command(interaction: discord.Interaction):
         "required_count, required_relic). Ersetzt eine bestehende Liste "
         "vollständig, mit Bestätigung und automatischem Backup.\n\n"
 
-        "**`/tbreminder_platoons_check planet`**\n"
+        "**`/tbreminder_planets_check planet`**\n"
         "Zeigt Fehlbestand pro Einheit für einen Planeten -- diagnostisch, "
         "keine Ping-Buttons.\n\n"
 
-        "**`/tbreminder_platoons_ping planet`**\n"
-        "Ruft alle Besitzer der benötigten Einheiten zur Teilnahme auf, "
-        "mit einem Ping-Button pro Einheit plus 'Alle pingen'.\n\n"
+        "**`/tbreminder_planets_ping planet`**\n"
+        "Ruft alle Besitzer der benötigten Einheiten eines Planeten zur "
+        "Teilnahme auf, mit einem Ping-Button pro Einheit plus 'Alle pingen'.\n\n"
+
+        "**`/tbreminder_units_check unit relic`**\n"
+        "Zeigt alle Besitzer einer bestimmten Einheit ab einem Relic-Level -- "
+        "diagnostisch, unabhängig von der Anforderungsliste. Relic-Angabe "
+        "wird bei Schiffen ignoriert.\n\n"
+
+        "**`/tbreminder_units_ping unit relic`**\n"
+        "Wie `/tbreminder_units_check`, zusätzlich mit Ping-Button für die "
+        "gefundenen Besitzer.\n\n"
 
         "### ℹ️ Sonstiges\n"
         "**`/tbreminder_help`**\n"
