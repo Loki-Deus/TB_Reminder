@@ -30,6 +30,85 @@ import roster_read
 
 REQUIRED_COLUMNS = ("planet", "unit_name", "required_count", "required_relic")
 
+# Schiffe haben im Spiel kein Relic-System -- roster_units.relic_tier ist
+# für jeden Schiffs-Besitzer IMMER NULL, unabhängig von der tatsächlichen
+# Investition. compute_shortfall() unten weicht für diese Namen auf
+# roster_read.get_owners_of_unit_ignore_relic() aus, statt den normalen
+# relic-gefilterten Pfad zu nehmen -- sonst zeigt jedes Schiff dauerhaft
+# 0 verfügbare Besitzer, unabhängig vom tatsächlichen Gildenroster (live
+# aufgefallen, siehe Chat-Verlauf).
+#
+# Manuell gepflegte Liste, vom Stakeholder direkt bestätigt (siehe
+# Chat-Verlauf) -- Interimslösung. Der eigentlich korrekte, dauerhafte Weg
+# wäre, comlinks combatType-Feld beim Roster-Refresh in TW-Counter mit zu
+# erfassen und hier danach zu unterscheiden, statt eine Namensliste separat
+# zu pflegen, die bei neuen Schiffen im Spiel manuell nachgezogen werden
+# muss.
+SHIP_UNIT_NAMES = frozenset({
+    "Anakin's Eta-2 Starfighter",
+    "B-28 Extinction-class Bomber",
+    "BTL-B Y-wing Starfighter",
+    "Biggs Darklighter's X-wing",
+    "Bistan's U-wing",
+    "Cassian's U-wing",
+    "Chimaera",
+    "Clone Sergeant's ARC-170",
+    "Comeuppance",
+    "Ebon Hawk",
+    "Emperor's Shuttle",
+    "Endurance",
+    "Executor",
+    "Executrix",
+    "Finalizer",
+    "First Order SF TIE Fighter",
+    "First Order TIE Fighter",
+    "Fury-class Interceptor",
+    "Gauntlet Starfighter",
+    "Geonosian Soldier's Starfighter",
+    "Geonosian Spy's Starfighter",
+    "Ghost",
+    "Han's Millennium Falcon",
+    "Home One",
+    "Hound's Tooth",
+    "Hyena Bomber",
+    "IG-2000",
+    "Imperial TIE Bomber",
+    "Imperial TIE Fighter",
+    "Jedi Consular's Starfighter",
+    "Kylo Ren's Command Shuttle",
+    "Lando's Millennium Falcon",
+    "Leviathan",
+    "MG-100 StarFortress SF-17",
+    "Malevolence",
+    "Mark VI Interceptor",
+    "Negotiator",
+    "Outrider",
+    "Phantom II",
+    "Plo Koon's Jedi Starfighter",
+    "Poe Dameron's X-wing",
+    "Profundity",
+    "Raddus",
+    "Raven's Claw",
+    "Razor Crest",
+    "Rebel Y-wing",
+    "Resistance X-wing",
+    "Rex's ARC-170",
+    "Scimitar",
+    "Scythe",
+    "Sith Fighter",
+    "Slave I",
+    "TIE Advanced x1",
+    "TIE Dagger",
+    "TIE Echelon",
+    "TIE Reaper",
+    "TIE Silencer",
+    "TIE/IN Interceptor Prototype",
+    "Umbaran Starfighter",
+    "Vulture Droid",
+    "Wedge Antilles's X-wing",
+    "Xanadu Blood",
+})
+
 
 class RequirementsParseError(ValueError):
     """CSV fehlerhaft -- fehlende Spalten, ungültige Werte, oder eine
@@ -186,9 +265,21 @@ def compute_shortfall(planet: str) -> list[dict]:
     rows = get_planet_requirements(planet)
     result = []
     for row in rows:
-        min_raw_relic = config.display_relic_to_raw(row["required_relic"])
-        owners = roster_read.get_owners_of_unit(row["unit_id"], min_raw_relic)
+        if row["unit_name"] in SHIP_UNIT_NAMES:
+            # Kein Relic-System für Schiffe -- required_relic auf diesen
+            # Zeilen ist nicht bedeutungslos (siehe CSV), aber für die
+            # Besitzabfrage selbst nicht anwendbar. Siehe
+            # roster_read.get_owners_of_unit_ignore_relic()-Docstring.
+            owners = roster_read.get_owners_of_unit_ignore_relic(row["unit_id"])
+        else:
+            min_raw_relic = config.display_relic_to_raw(row["required_relic"])
+            owners = roster_read.get_owners_of_unit(row["unit_id"], min_raw_relic)
         shortfall = max(0, row["required_count"] - len(owners))
-        result.append({**row, "owners": owners, "shortfall": shortfall})
+        result.append({
+            **row,
+            "owners": owners,
+            "shortfall": shortfall,
+            "is_ship": row["unit_name"] in SHIP_UNIT_NAMES,
+        })
     result.sort(key=lambda r: -r["shortfall"])
     return result

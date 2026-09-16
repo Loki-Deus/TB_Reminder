@@ -95,6 +95,13 @@ def get_owners_of_unit(unit_id: str, min_raw_relic_tier: int) -> list[sqlite3.Ro
     relic_tier IS NULL (keine Relic-Angabe, z.B. unterhalb Gear 13) wird
     immer ausgeschlossen, unabhängig vom Schwellwert. Sortiert nach
     relic_tier/gear_tier absteigend.
+
+    NICHT für Schiffe geeignet -- Schiffe haben im Spiel überhaupt kein
+    Relic-System, weshalb roster_units.relic_tier für JEDEN Schiffs-
+    Besitzer IMMER NULL ist. Diese Funktion würde also für jede Schiffs-
+    unit_id unabhängig vom Schwellwert 0 Zeilen liefern, selbst wenn die
+    Gilde das Schiff breit besitzt -- siehe get_owners_of_unit_ignore_relic()
+    für den richtigen Zugriffsweg bei Schiffen.
     """
     with get_connection() as conn:
         return conn.execute(
@@ -106,4 +113,41 @@ def get_owners_of_unit(unit_id: str, min_raw_relic_tier: int) -> list[sqlite3.Ro
             ORDER BY r.relic_tier DESC, r.gear_tier DESC
             """,
             (unit_id, min_raw_relic_tier),
+        ).fetchall()
+
+
+def get_owners_of_unit_ignore_relic(unit_id: str) -> list[sqlite3.Row]:
+    """
+    Gildenmitglieder, die eine bestimmte Einheit besitzen -- OHNE
+    Relic-Filter. Für Einheiten, die im Spiel gar kein Relic-System
+    haben (aktuell: Schiffe) ist ein Filter auf relic_tier sinnlos,
+    da diese Spalte für solche Einheiten immer NULL ist -- ein Filter
+    "relic_tier IS NOT NULL AND relic_tier >= X" würde dann JEDEN
+    Besitzer ausschließen, unabhängig davon, wie viele die Gilde
+    tatsächlich besitzt (siehe Chat-Verlauf, live aufgefallen bei
+    /tbreminder_platoons_check).
+
+    Interimslösung (siehe requirements.py's SHIP_UNIT_NAMES): der
+    korrekte, dauerhafte Fix wäre, comlinks combatType-Feld beim
+    Roster-Refresh mit zu erfassen (TW-Counters roster.py/db.py) und
+    hier danach zu unterscheiden, statt einer manuell gepflegten
+    Namensliste auf tb-reminder-Seite. Diese Funktion ist der schnelle,
+    korrekte Zwischenschritt, der ohne einen weiteren Roster-Refresh-
+    Zyklus oder ein TW-Counter-Schema-Update auskommt.
+
+    "Besitz" heißt hier: irgendein Eintrag in roster_units für diese
+    unit_id, unabhängig von rarity/gear_tier -- ein Schiff hat kein
+    einsatzfähiges/nicht-einsatzfähiges Relic-Level, das gefiltert
+    werden könnte, also zählt reiner Besitz.
+    """
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT p.player_name, p.discord_id, r.gear_tier, r.relic_tier
+            FROM roster_units r
+            JOIN players p ON p.ally_code = r.ally_code
+            WHERE r.unit_id = ?
+            ORDER BY r.gear_tier DESC
+            """,
+            (unit_id,),
         ).fetchall()

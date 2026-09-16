@@ -1180,9 +1180,30 @@ async def planet_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
+def _format_owner_names(row: dict) -> str:
+    """Gemeinsame Besitzer-Namensformatierung für beide Platoon-Textausgaben.
+    Bei Schiffen wird kein '(RX)' angehängt -- relic_tier ist dort immer
+    None (siehe requirements.compute_shortfall()), und 'R0' würde
+    fälschlich so lesen, als gäbe es ein Relic-Level 0."""
+    if row.get("is_ship"):
+        return ", ".join(o["player_name"] for o in row["owners"])
+    return ", ".join(
+        f"{o['player_name']} (R{config.relic_tier_to_display(o['relic_tier'])})"
+        for o in row["owners"]
+    )
+
+
 def format_platoon_report(planet: str, rows: list[dict]) -> str:
     """Textausgabe für /tbreminder_platoons_check -- diagnostisch,
-    Verfügbar-/Fehlend-Aufschlüsselung pro Einheit, keine Buttons."""
+    Verfügbar-/Fehlend-Aufschlüsselung pro Einheit, keine Buttons.
+
+    Namen der Besitzer werden NUR bei tatsächlicher Unterdeckung
+    aufgelistet -- bei ausreichender Deckung reicht die Zahl. Ohne das
+    sprengt ein Planet mit vielen breit besessenen Einheiten (jede mit
+    einer vollen Namensliste, obwohl längst gedeckt) Discords 2000-
+    Zeichen-Limit über mehrere Nachrichten hinweg, ohne dass die
+    zusätzliche Information irgendeinen diagnostischen Wert hätte --
+    genau der Fall, der live aufgefallen ist (siehe Chat-Verlauf)."""
     lines = [f"📋 {planet} — Platoons\n"]
     for row in rows:
         marker = "⚠️" if row["shortfall"] > 0 else "✅"
@@ -1192,15 +1213,14 @@ def format_platoon_report(planet: str, rows: list[dict]) -> str:
         )
         owners = row["owners"]
         plural = "er" if len(owners) != 1 else ""
-        lines.append(
-            f"   Verfügbar: {len(owners)} Mitglied{plural} auf Relic {row['required_relic']}+"
-        )
-        if owners:
-            names = ", ".join(
-                f"{o['player_name']} (R{config.relic_tier_to_display(o['relic_tier'])})"
-                for o in owners
+        if row.get("is_ship"):
+            lines.append(f"   Verfügbar: {len(owners)} Mitglied{plural} (Schiff, kein Relic-Erfordernis)")
+        else:
+            lines.append(
+                f"   Verfügbar: {len(owners)} Mitglied{plural} auf Relic {row['required_relic']}+"
             )
-            lines.append(f"   → {names}")
+        if row["shortfall"] > 0 and owners:
+            lines.append(f"   → {_format_owner_names(row)}")
         if row["shortfall"] > 0:
             lines.append(f"   Fehlend: {row['shortfall']}")
         lines.append("")
@@ -1211,20 +1231,23 @@ def format_platoon_fill_report(planet: str, rows: list[dict]) -> str:
     """Textausgabe für /tbreminder_platoons_ping -- Teilnahme-fokussiert,
     (N fehlt)/(ausreichend) am Einheitennamen statt eines separaten
     Verfügbar-Blocks. Die eigentlichen Ping-Buttons kommen von
-    PlatoonPingView, nicht von diesem Text."""
+    PlatoonPingView, nicht von diesem Text.
+
+    Gleiches Prinzip wie format_platoon_report(): Namen nur bei
+    Unterdeckung auflisten. Der Ping-Button selbst pingt trotzdem ALLE
+    registrierten Besitzer (row["owners"] direkt, unabhängig von diesem
+    Text) -- nur die textuelle Vorschau wird gekürzt, nicht die
+    tatsächliche Ping-Funktionalität."""
     lines = [f"{planet} — Operation füllen\n"]
     for row in rows:
         status = f"({row['shortfall']} fehlt)" if row["shortfall"] > 0 else "(ausreichend)"
         lines.append(f"{row['unit_name']} {status}")
         owners = row["owners"]
-        if owners:
-            names = ", ".join(
-                f"{o['player_name']} (R{config.relic_tier_to_display(o['relic_tier'])})"
-                for o in owners
-            )
-            lines.append(f"   → {names}")
-        else:
-            lines.append("   → niemand verfügbar")
+        if row["shortfall"] > 0:
+            if owners:
+                lines.append(f"   → {_format_owner_names(row)}")
+            else:
+                lines.append("   → niemand verfügbar")
         lines.append("")
     return "\n".join(lines).rstrip()
 
