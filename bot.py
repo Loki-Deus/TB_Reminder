@@ -1608,7 +1608,7 @@ async def _lookup_unit(unit: str, relic: int):
 
 @tree.command(
     name="tbreminder_units_check",
-    description="Zeigt alle Besitzer einer bestimmten Einheit auf einem Relic-Level (diagnostisch, keine Ping-Buttons)",
+    description="Zeigt Besitzer einer Einheit ab einem Relic-Level (diagnostisch, keine Ping-Buttons)",
 )
 @app_commands.describe(
     unit="Einheit (nur was mindestens ein Gildenmitglied laut Roster besitzt)",
@@ -1639,7 +1639,7 @@ async def units_check(
 
 @tree.command(
     name="tbreminder_units_ping",
-    description="Zeigt und pingt alle Besitzer einer bestimmten Einheit auf einem Relic-Level -- unabhängig von der Anforderungsliste",
+    description="Zeigt und pingt Besitzer einer Einheit ab einem Relic-Level (unabhängig von der Anforderungsliste)",
 )
 @app_commands.describe(
     unit="Einheit (nur was mindestens ein Gildenmitglied laut Roster besitzt)",
