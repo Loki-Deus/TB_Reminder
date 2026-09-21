@@ -25,8 +25,10 @@ def _require_int(name: str) -> int:
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = _require_int("GUILD_ID")
-TW_CHANNEL_ID = _require_int("TW_CHANNEL_ID")
-OFFICER_ID = _require_int("OFFICER_ID")
+TB_CHANNEL_ID = _require_int("TB_CHANNEL_ID")
+# Kanal "rote-organisation": hier landen ab jetzt ALLE Auswahl-Dialoge und
+# Bot-Hinweise, die vorher als DM an OFFICER_ID gingen (OFFICER_ID entfällt).
+ORG_CHANNEL_ID = _require_int("ORG_CHANNEL_ID")
 MANAGER_IDS = {int(i) for i in os.getenv("MANAGER_IDS", "").split(",") if i.strip()}
 MEMBER_ROLE_ID = _require_int("MEMBER_ROLE_ID")
 
@@ -44,10 +46,38 @@ ROSTER_DB_PATH = os.getenv("ROSTER_DB_PATH")
 BOT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Vienna"))
 
 HOURS = 3600
-OFFICER_TIMEOUT = 1 * HOURS
-PHASE_WAIT_FIRST = 22 * HOURS
-PHASE_WAIT_LATER = 24 * HOURS
 PHASE_COUNT = 6
+
+# Zeitmodell. T = Phasenende (Phasen dauern 24 h).
+#   T - PLAYER_REMINDER_OFFSET   Bot postet die Spielerauswahl in rote-organisation
+#   T - GENERIC_REMINDER_OFFSET  generische @everyone-Erinnerung, ABER nur wenn
+#                                bis dahin niemand bestätigt hat (Skip oder
+#                                Timeout) -- nach einer Bestätigung entfällt sie
+# Der Timeout der Auswahl ist die Differenz der beiden Offsets. Vorher war
+# das eine einzige Konstante (OFFICER_TIMEOUT = 1 h), die gleichzeitig
+# Auswahl-Timeout UND Abstand zur generischen Erinnerung war; das lässt sich
+# bei einem Offset > 2 h nicht mehr sinnvoll teilen.
+PHASE_LENGTH = 24 * HOURS
+PLAYER_REMINDER_OFFSET = 4 * HOURS
+GENERIC_REMINDER_OFFSET = 1 * HOURS
+PICKER_TIMEOUT = PLAYER_REMINDER_OFFSET - GENERIC_REMINDER_OFFSET
+
+# Abstand zwischen zwei Triggern (= Phasenlänge) und Wartezeit bis zum ersten
+# Trigger nach TB-Start. Gilt überall, wo bisher 22 * HOURS / 24 * HOURS
+# hartkodiert stand (run_sequence, /tbreminder_resume, /tbreminder_status).
+TRIGGER_INTERVAL = PHASE_LENGTH
+FIRST_TRIGGER_WAIT = PHASE_LENGTH - PLAYER_REMINDER_OFFSET
+
+# Frist für die "Wer hat NICHT stationiert?"-Auswahl nach Phase 6 (für Phase
+# 1-5 endet sie mit dem nächsten Trigger, siehe handle_phase_end). Wert wie
+# bisher.
+FINAL_FAILED_TIMEOUT = 22 * HOURS
+
+
+def trigger_wait(phase_index: int) -> int:
+    """Wartezeit in Sekunden bis zum Trigger der Phase phase_index (0-5),
+    gemessen ab dem vorherigen Trigger bzw. ab TB-Start."""
+    return FIRST_TRIGGER_WAIT if phase_index == 0 else TRIGGER_INTERVAL
 
 PHASE_END_MESSAGES = [
     "Phase 1 endet bald!",

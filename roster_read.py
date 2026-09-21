@@ -130,7 +130,7 @@ def get_owners_of_unit(unit_id: str, min_raw_relic_tier: int) -> list[sqlite3.Ro
     with get_connection() as conn:
         return conn.execute(
             """
-            SELECT p.player_name, p.discord_id, r.gear_tier, r.relic_tier
+            SELECT p.ally_code, p.player_name, p.discord_id, r.gear_tier, r.relic_tier
             FROM roster_units r
             JOIN players p ON p.ally_code = r.ally_code
             WHERE r.unit_id = ? AND r.relic_tier IS NOT NULL AND r.relic_tier >= ?
@@ -167,7 +167,7 @@ def get_owners_of_unit_ignore_relic(unit_id: str) -> list[sqlite3.Row]:
     with get_connection() as conn:
         return conn.execute(
             """
-            SELECT p.player_name, p.discord_id, r.gear_tier, r.relic_tier
+            SELECT p.ally_code, p.player_name, p.discord_id, r.gear_tier, r.relic_tier
             FROM roster_units r
             JOIN players p ON p.ally_code = r.ally_code
             WHERE r.unit_id = ?

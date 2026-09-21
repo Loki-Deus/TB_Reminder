@@ -23,12 +23,12 @@ from stats import (
 
 TOKEN           = config.TOKEN
 GUILD_ID        = config.GUILD_ID
-TW_CHANNEL_ID   = config.TW_CHANNEL_ID
-OFFICER_ID      = config.OFFICER_ID
+TB_CHANNEL_ID   = config.TB_CHANNEL_ID
+ORG_CHANNEL_ID  = config.ORG_CHANNEL_ID
 MANAGER_IDS     = config.MANAGER_IDS
 MEMBER_ROLE_ID  = config.MEMBER_ROLE_ID
 HOURS           = config.HOURS
-OFFICER_TIMEOUT = config.OFFICER_TIMEOUT
+PICKER_TIMEOUT  = config.PICKER_TIMEOUT
 BOT_TZ          = config.BOT_TZ
 PHASE_END_MESSAGES = config.PHASE_END_MESSAGES
 GENERIC_REMINDER   = config.GENERIC_REMINDER
@@ -42,10 +42,6 @@ is_running = False
 pending_timer: asyncio.Task | None = None
 running_task: asyncio.Task | None = None
 _startup_recovery_done = False  # verhindert Re-Trigger bei Gateway-Reconnects
-# Zwischenspeicher für die Phasenend-Nachprüfung (siehe handle_phase_end):
-# der zuletzt per /tbreminder_planets_check geprüfte Planet dieser Phase,
-# zurückgesetzt bei jedem neuen Phasenübergang in run_sequence.
-_last_checked_planet: str | None = None
 
 # stats.json-Struktur und alle Buchhaltungsfunktionen: siehe stats.py.
 
@@ -59,240 +55,373 @@ def is_authorized(interaction: discord.Interaction) -> bool:
     )
 
 
-# ── Player selection UI ───────────────────────────────────────────────────────
+def can_use_org_commands(interaction: discord.Interaction) -> bool:
+    """
+    Platoon-/Unit-Befehle (planets_check/-ping, units_check/-ping): offen für
+    jeden, der sie in rote-organisation ausführt -- keine Rollen- oder
+    Manager-Prüfung darüber hinaus, der Zugriff auf den Kanal ist die
+    Hürde. Admins/Manager dürfen sie zusätzlich in jedem Kanal nutzen (z.B.
+    zum Testen). Ohne die Kanalbindung könnte jeder mit Serverzugriff die
+    Ping-Buttons aus beliebigen Kanälen auslösen.
 
-class PlayerSelectView(discord.ui.View):
-    """Officer picks players to send a personal reminder to."""
-    def __init__(self, members: list[discord.Member]):
-        super().__init__(timeout=OFFICER_TIMEOUT)
-        self.selected_ids: set[str] = set()
-        self.confirmed = False
-        self._skipped = False
-
-        chunk1 = members[:25]
-        chunk2 = members[25:50]
-
-        self._add_select(chunk1, "Spieler 1-25 auswaehlen...", "select_1")
-        if chunk2:
-            self._add_select(chunk2, "Spieler 26-50 auswaehlen...", "select_2")
-
-        confirm_btn = discord.ui.Button(
-            label="Bestaetigen & senden",
-            style=discord.ButtonStyle.green,
-            row=2,
-        )
-        confirm_btn.callback = self._on_confirm
-        self.add_item(confirm_btn)
-
-        skip_btn = discord.ui.Button(
-            label="Ueberspringen (generische Nachricht)",
-            style=discord.ButtonStyle.grey,
-            row=2,
-        )
-        skip_btn.callback = self._on_skip
-        self.add_item(skip_btn)
-
-    def _add_select(self, members: list[discord.Member], placeholder: str, custom_id: str):
-        options = [
-            discord.SelectOption(label=m.display_name, value=str(m.id))
-            for m in members
-        ]
-        select = discord.ui.Select(
-            placeholder=placeholder,
-            min_values=0,
-            max_values=len(options),
-            options=options,
-            custom_id=custom_id,
-        )
-        select.callback = self._on_select
-        self.add_item(select)
-
-    async def _on_select(self, interaction: discord.Interaction):
-        chosen = set(interaction.data["values"])
-        custom_id = interaction.data["custom_id"]
-
-        if custom_id == "select_1":
-            pool = {o.value for item in self.children
-                    if isinstance(item, discord.ui.Select) and item.custom_id == "select_1"
-                    for o in item.options}
-        else:
-            pool = {o.value for item in self.children
-                    if isinstance(item, discord.ui.Select) and item.custom_id == "select_2"
-                    for o in item.options}
-
-        self.selected_ids -= pool
-        self.selected_ids |= chosen
-
-        await interaction.response.send_message(
-            f"Aktuell ausgewaehlt: **{len(self.selected_ids)} Spieler**\n"
-            "Druecke *Bestaetigen* wenn du fertig bist.",
-            ephemeral=True,
-        )
-
-    async def _on_confirm(self, interaction: discord.Interaction):
-        if not self.selected_ids:
-            await interaction.response.send_message(
-                "Du hast noch niemanden ausgewaehlt!", ephemeral=True
-            )
-            return
-        self.confirmed = True
-        await interaction.response.edit_message(
-            content=f"Bestaetigt! {len(self.selected_ids)} Spieler erhalten eine persoenliche Nachricht.",
-            view=None,
-        )
-        self.stop()
-
-    async def _on_skip(self, interaction: discord.Interaction):
-        self.confirmed = False
-        self._skipped = True
-        await interaction.response.edit_message(
-            content="Uebersprungen. Eine generische Nachricht wird gesendet.",
-            view=None,
-        )
-        self.stop()
-
-    async def on_timeout(self):
-        self.confirmed = False
-        self._skipped = False
-        try:
-            await self.message.edit(
-                content="Zeit abgelaufen! Keine Auswahl getroffen - eine generische Nachricht wurde gesendet.",
-                view=None,
-            )
-        except Exception:
-            pass
+    Die Ablaufsteuerung (start, timer, resume, cancel, status, results,
+    requirements_upload) bleibt bei is_authorized().
+    """
+    return interaction.channel_id == ORG_CHANNEL_ID or is_authorized(interaction)
 
 
-class FailedSetView(discord.ui.View):
-    """Officer picks players who failed to set their troops this phase."""
-    def __init__(self, members: list[discord.Member], timeout: float = OFFICER_TIMEOUT):
+async def deny_org_only(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"Dieser Befehl ist in <#{ORG_CHANNEL_ID}> verfügbar.", ephemeral=True
+    )
+
+
+# ── Auswahl-UI (gemeinsame Basis) ─────────────────────────────────────────────
+
+SELECT_MAX_OPTIONS = 25  # Discord-Hartlimit pro Dropdown
+NO_MENTIONS = discord.AllowedMentions.none()
+
+
+class MultiSelectView(discord.ui.View):
+    """
+    Gemeinsame Basis für alle Mehrfachauswahl-Dialoge (Erinnerungsauswahl,
+    "Wer hat NICHT stationiert?", Besitzerauswahl bei /tbreminder_units_*).
+    Ersetzt die zwei früheren, bis auf Labels identischen Kopien
+    PlayerSelectView/FailedSetView.
+
+    Was sich gegenüber den DM-Versionen ändert, weil die Dialoge jetzt in
+    einem Kanal stehen und JEDER dort klicken darf:
+
+    * Der Auswahlzustand ist EIN gemeinsamer Satz (selected_ids) und wird
+      nach jeder Änderung als Nachrichtentext (Namen) UND als
+      SelectOption.default in die Dropdowns zurückgeschrieben. Alle
+      Betrachter sehen dadurch denselben Stand, und ein Klient sendet beim
+      nächsten Klick "gemeinsamer Stand +/- eigene Änderung" statt eines
+      veralteten Eigenstands. Vorher gab es nur eine ephemere "N
+      ausgewählt"-Antwort -- bei mehreren Bedienern unsichtbar überschreibbar.
+      Restrisiko: zwei Klicks im selben Sekundenbruchteil, Last-write-wins.
+    * timeout=None + harte Frist über wait_until(). discord.py misst
+      View.timeout ab der LETZTEN Interaktion (View._refresh_timeout); in
+      einem Kanal, in dem mehrere Leute klicken, würde ein Klick kurz vor
+      Fristende die Frist verlängern und die generische Erinnerung nach
+      hinten schieben.
+    """
+
+    def __init__(
+        self,
+        items: list[tuple[str, str, str | None]],
+        *,
+        header: str,
+        noun: str = "Spieler",
+        show_names: bool = True,
+        preselected: set[str] | None = None,
+        timeout: float | None = None,
+    ):
         super().__init__(timeout=timeout)
-        self.selected_ids: set[str] = set()
+        self.header = header
+        self.show_names = show_names
+        self.selected_ids: set[str] = set(preselected or ())
+        self.status_lines: list[str] = []
         self.confirmed = False
-        self._skipped = False
+        self.skipped = False
+        self.timed_out = False
+        self.closed = False
+        self.actor_name: str | None = None
+        self.message: discord.Message | None = None
+        self._labels = {value: label for value, label, _ in items}
+        self._selects: list[discord.ui.Select] = []
 
-        chunk1 = members[:25]
-        chunk2 = members[25:50]
+        # Discord: max. 5 Zeilen pro Nachricht, ein Dropdown belegt eine
+        # Zeile, die Buttons der Unterklassen brauchen eine -> höchstens 4
+        # Dropdowns = 100 Einträge (SWGOH-Gilden haben max. 50 Mitglieder).
+        items = items[: 4 * SELECT_MAX_OPTIONS]
+        for start in range(0, len(items), SELECT_MAX_OPTIONS):
+            chunk = items[start : start + SELECT_MAX_OPTIONS]
+            options = [
+                discord.SelectOption(
+                    label=label[:100],
+                    value=value,
+                    description=(description[:100] if description else None),
+                    default=value in self.selected_ids,
+                )
+                for value, label, description in chunk
+            ]
+            select = discord.ui.Select(
+                placeholder=f"{noun} {start + 1}-{start + len(chunk)} auswählen...",
+                min_values=0,
+                max_values=len(options),
+                options=options,
+            )
+            select.callback = self._make_select_callback(select)
+            self._selects.append(select)
+            self.add_item(select)
 
-        self._add_select(chunk1, "Spieler 1-25 auswaehlen...", "fselect_1")
-        if chunk2:
-            self._add_select(chunk2, "Spieler 26-50 auswaehlen...", "fselect_2")
+    # ── Darstellung ───────────────────────────────────────────────────────
 
-        confirm_btn = discord.ui.Button(
-            label="Bestaetigen (nicht stationiert)",
-            style=discord.ButtonStyle.red,
-            row=2,
-        )
+    def _selection_line(self) -> str:
+        if not self.selected_ids:
+            return "*Noch niemand ausgewählt.*"
+        if self.show_names:
+            names = ", ".join(
+                sorted((self._labels[v] for v in self.selected_ids), key=str.lower)
+            )
+            return f"**Ausgewählt ({len(self.selected_ids)}):** {names}"
+        return f"**Ausgewählt:** {len(self.selected_ids)}"
+
+    def _content(self) -> str:
+        parts = [self.header]
+        if self.status_lines:
+            parts.append("\n".join(self.status_lines))
+        parts.append(self._selection_line())
+        text = "\n\n".join(parts)
+        if len(text) > 1990 and self.show_names:
+            # Notbremse gegen Discords 2000-Zeichen-Limit: nur Anzahl statt Namen
+            parts[-1] = f"**Ausgewählt:** {len(self.selected_ids)}"
+            text = "\n\n".join(parts)
+        return text[:1990]
+
+    def _sync_defaults(self) -> None:
+        """Gemeinsamen Stand in die Dropdowns zurückschreiben, siehe Docstring."""
+        for select in self._selects:
+            for option in select.options:
+                option.default = option.value in self.selected_ids
+
+    # ── Callbacks ─────────────────────────────────────────────────────────
+
+    async def _reject_if_closed(self, interaction: discord.Interaction) -> bool:
+        if self.closed:
+            await interaction.response.send_message(
+                "Diese Auswahl ist bereits abgeschlossen.", ephemeral=True
+            )
+            return True
+        return False
+
+    def _make_select_callback(self, select: discord.ui.Select):
+        async def _callback(interaction: discord.Interaction):
+            if await self._reject_if_closed(interaction):
+                return
+            pool = {option.value for option in select.options}
+            self.selected_ids -= pool
+            self.selected_ids |= set(select.values)
+            self._sync_defaults()
+            await interaction.response.edit_message(content=self._content(), view=self)
+
+        return _callback
+
+    # ── Abschluss ─────────────────────────────────────────────────────────
+
+    async def edit_message(self, **kwargs) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(**kwargs)
+        except discord.HTTPException as e:
+            print(f"Konnte Auswahl-Nachricht nicht bearbeiten: {e}")
+
+    async def finalize(self, text: str) -> None:
+        """Nachricht in ihr Endergebnis umschreiben (statt eine weitere zu
+        posten -- weniger Rauschen im Kanal)."""
+        await self.edit_message(content=text[:1990], view=None)
+
+    async def wait_until(self, seconds: float, timeout_text: str) -> None:
+        """Wartet bis Bestätigen/Überspringen ODER harte Frist. Bei
+        Fristablauf: Dialog schließen (danach lehnen alle Callbacks ab) und
+        die Nachricht auf timeout_text umschreiben. shield(), damit der
+        wait_for-Abbruch nicht das interne Stopped-Future der View cancelt."""
+        try:
+            await asyncio.wait_for(asyncio.shield(self.wait()), timeout=seconds)
+        except asyncio.TimeoutError:
+            if self.closed:  # in genau diesem Moment bestätigt/übersprungen
+                return
+            self.closed = True
+            self.timed_out = True
+            self.stop()
+            await self.edit_message(content=timeout_text, view=None)
+
+
+class PhasePickerView(MultiSelectView):
+    """Auswahl mit "Bestätigen" und "Überspringen" -- Basis für die beiden
+    Phasenend-Dialoge. Unterklassen setzen nur Beschriftungen und Texte."""
+
+    def __init__(
+        self,
+        members: list[discord.Member],
+        *,
+        header: str,
+        confirm_label: str,
+        confirm_style: discord.ButtonStyle,
+        skip_label: str,
+        confirm_text: str,
+        skip_text: str,
+    ):
+        items = [(str(m.id), m.display_name, None) for m in members]
+        super().__init__(items, header=header)
+        self._confirm_text = confirm_text
+        self._skip_text = skip_text
+
+        confirm_btn = discord.ui.Button(label=confirm_label, style=confirm_style)
         confirm_btn.callback = self._on_confirm
         self.add_item(confirm_btn)
 
-        skip_btn = discord.ui.Button(
-            label="Alle haben stationiert",
-            style=discord.ButtonStyle.grey,
-            row=2,
-        )
+        skip_btn = discord.ui.Button(label=skip_label, style=discord.ButtonStyle.grey)
         skip_btn.callback = self._on_skip
         self.add_item(skip_btn)
 
-    def _add_select(self, members: list[discord.Member], placeholder: str, custom_id: str):
-        options = [
-            discord.SelectOption(label=m.display_name, value=str(m.id))
-            for m in members
-        ]
-        select = discord.ui.Select(
-            placeholder=placeholder,
-            min_values=0,
-            max_values=len(options),
-            options=options,
-            custom_id=custom_id,
-        )
-        select.callback = self._on_select
-        self.add_item(select)
-
-    async def _on_select(self, interaction: discord.Interaction):
-        chosen = set(interaction.data["values"])
-        custom_id = interaction.data["custom_id"]
-
-        if custom_id == "fselect_1":
-            pool = {o.value for item in self.children
-                    if isinstance(item, discord.ui.Select) and item.custom_id == "fselect_1"
-                    for o in item.options}
-        else:
-            pool = {o.value for item in self.children
-                    if isinstance(item, discord.ui.Select) and item.custom_id == "fselect_2"
-                    for o in item.options}
-
-        self.selected_ids -= pool
-        self.selected_ids |= chosen
-
-        await interaction.response.send_message(
-            f"Aktuell ausgewaehlt: **{len(self.selected_ids)} Spieler**\n"
-            "Druecke *Bestaetigen* wenn du fertig bist.",
-            ephemeral=True,
-        )
-
     async def _on_confirm(self, interaction: discord.Interaction):
+        if await self._reject_if_closed(interaction):
+            return
         if not self.selected_ids:
             await interaction.response.send_message(
-                "Du hast noch niemanden ausgewaehlt!", ephemeral=True
+                "Es ist noch niemand ausgewählt!", ephemeral=True
             )
             return
+        self.closed = True
         self.confirmed = True
+        self.actor_name = interaction.user.display_name
         await interaction.response.edit_message(
-            content=f"Bestaetigt! {len(self.selected_ids)} Spieler als nicht stationiert markiert.",
+            content=self._confirm_text.format(
+                n=len(self.selected_ids), user=self.actor_name
+            ),
             view=None,
         )
         self.stop()
 
     async def _on_skip(self, interaction: discord.Interaction):
-        self.confirmed = False
-        self._skipped = True
+        if await self._reject_if_closed(interaction):
+            return
+        self.closed = True
+        self.skipped = True
+        self.actor_name = interaction.user.display_name
         await interaction.response.edit_message(
-            content="Alle haben stationiert - keine Eintrage.",
-            view=None,
+            content=self._skip_text.format(user=self.actor_name), view=None
         )
         self.stop()
 
-    async def on_timeout(self):
-        self.confirmed = False
-        self._skipped = False
-        try:
-            await self.message.edit(
-                content="Zeit abgelaufen - keine Fehlenden eingetragen.",
-                view=None,
-            )
-        except Exception:
-            pass
+
+class PlayerSelectView(PhasePickerView):
+    """Erinnerungsauswahl: wer bekommt eine persönliche DM."""
+
+    def __init__(self, members: list[discord.Member], header: str):
+        super().__init__(
+            members,
+            header=header,
+            confirm_label="Bestätigen & senden",
+            confirm_style=discord.ButtonStyle.green,
+            skip_label="Überspringen (generische Nachricht)",
+            confirm_text="✅ Bestätigt von {user}: {n} Spieler erhalten eine persönliche DM...",
+            skip_text="⏭️ Übersprungen von {user}. Die generische Nachricht wird gesendet.",
+        )
+
+
+class FailedSetView(PhasePickerView):
+    """Wer hat in dieser Phase NICHT stationiert."""
+
+    def __init__(self, members: list[discord.Member], header: str):
+        super().__init__(
+            members,
+            header=header,
+            confirm_label="Bestätigen (nicht stationiert)",
+            confirm_style=discord.ButtonStyle.red,
+            skip_label="Alle haben stationiert",
+            confirm_text="✅ {user}: {n} Spieler als nicht stationiert markiert.",
+            skip_text="✅ {user}: Alle haben stationiert - keine Einträge.",
+        )
+
+
+# ── DM-Versand (gemeinsam für Phasenend-Erinnerung und Unit-DMs) ──────────────
+
+# (key, anzeigename, ziel) -- key ist beliebig (Discord-ID, Ally-Code) und
+# kommt unverändert im Ergebnis zurück; ziel=None heißt "nicht auffindbar".
+DmRecipient = tuple[str, str, "discord.abc.Messageable | None"]
+
+
+async def send_dms(
+    recipients: list[DmRecipient], text: str
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
+    """
+    Sendet text an jeden Empfänger. Rückgabe: (sent, failed) mit
+    sent = [(key, name)], failed = [(key, name, grund)].
+
+    Der Grund unterscheidet jetzt, was früher alles unter "DMs deaktiviert"
+    lief: Forbidden (wirklich deaktiviert), 503 nach 3 Versuchen,
+    unerwarteter Fehler, Empfänger nicht auffindbar.
+    """
+    sent: list[tuple[str, str]] = []
+    failed: list[tuple[str, str, str]] = []
+
+    for key, name, target in recipients:
+        if target is None:
+            failed.append((key, name, "nicht auf dem Server gefunden"))
+            continue
+
+        reason: str | None = None
+        for attempt in range(3):
+            try:
+                await target.send(text)
+                reason = None
+                break
+            except discord.Forbidden:
+                print(f"Konnte {name} keine DM senden (DMs deaktiviert)")
+                reason = "DMs deaktiviert"
+                break
+            except discord.DiscordServerError:
+                reason = "Discord-Serverfehler (3 Versuche)"
+                if attempt < 2:
+                    print(f"Discord 503 beim Senden an {name}, Versuch {attempt + 1}/3 - warte 5s...")
+                    await asyncio.sleep(5)
+                else:
+                    print(f"Discord 503 beim Senden an {name} nach 3 Versuchen - uebersprungen.")
+            except Exception as e:
+                print(f"Unerwarteter Fehler beim Senden an {name}: {e} - uebersprungen.")
+                reason = f"Fehler ({type(e).__name__})"
+                break
+
+        if reason is None:
+            sent.append((key, name))
+        else:
+            failed.append((key, name, reason))
+
+    return sent, failed
+
+
+def _format_failed(failed: list[tuple[str, str, str]]) -> str:
+    return ", ".join(f"{name} ({reason})" for _, name, reason in sorted(failed, key=lambda f: f[1].lower()))
 
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
 async def handle_phase_end(
     phase_index: int,
-    tw_channel: discord.TextChannel,
+    tb_channel: discord.TextChannel,
     stats: dict,
     tb_index: int,
     next_phase_wait: float = 0,
     is_last_phase: bool = False,
 ):
+    """
+    Läuft PLAYER_REMINDER_OFFSET vor Phasenende (siehe config.py):
+      1. Auswahl der zu erinnernden Spieler in rote-organisation posten;
+         bis GENERIC_REMINDER_OFFSET vor Phasenende kann dort jeder
+         auswählen und bestätigen.
+      2. Bestätigt  -> persönliche DMs, KEINE generische Nachricht.
+         Übersprungen oder Frist abgelaufen -> generische Nachricht im
+         TB-Kanal.
+      3. "Wer hat NICHT stationiert?"-Auswahl (Hintergrundtask).
+    """
     phase_num = phase_index + 1
-    print(f"Phase {phase_num} endet bald - Officer wird kontaktiert...")
+    started = time.monotonic()
+    print(f"Phase {phase_num} endet in {config.PLAYER_REMINDER_OFFSET / HOURS:.0f}h - Auswahl wird in rote-organisation gepostet...")
 
     async def send_generic():
-        await tw_channel.send(f"@everyone {GENERIC_REMINDER}")
+        await tb_channel.send(f"@everyone {GENERIC_REMINDER}")
 
-    try:
-        officer = await bot.fetch_user(OFFICER_ID)
-    except discord.NotFound:
-        print(f"Officer (ID {OFFICER_ID}) nicht gefunden - generische Nachricht wird gesendet")
-        await send_generic()
-        return
-    except discord.HTTPException as e:
-        print(f"Netzwerkfehler beim Abrufen des Officers ({e}) - generische Nachricht wird gesendet")
+    org_channel = bot.get_channel(ORG_CHANNEL_ID)
+    if org_channel is None:
+        print(f"Kanal rote-organisation (ID {ORG_CHANNEL_ID}) nicht gefunden - generische Nachricht wird gesendet")
         await send_generic()
         return
 
-    guild  = tw_channel.guild
+    guild  = tb_channel.guild
     role   = guild.get_role(MEMBER_ROLE_ID)
 
     if role is None:
@@ -311,114 +440,94 @@ async def handle_phase_end(
         return
 
     # ── Step 1: Reminder picker ───────────────────────────────────────────────
-    reminder_view = PlayerSelectView(members)
+    picker_deadline = int(time.time()) + int(PICKER_TIMEOUT)
+    reminder_view = PlayerSelectView(
+        members,
+        header=(
+            f"**Phase {phase_num} endet in ca. {config.PLAYER_REMINDER_OFFSET // HOURS} Stunden! (Territory Battle)**\n"
+            f"Wählt die Spieler aus, die eine persönliche DM-Erinnerung erhalten sollen, "
+            f"und klickt dann auf *Bestätigen & senden*. Jeder darf auswählen.\n"
+            f"Frist: <t:{picker_deadline}:t> (<t:{picker_deadline}:R>). Ohne Bestätigung bis dahin "
+            f"geht die generische Erinnerung an alle in {tb_channel.mention} raus."
+        ),
+    )
 
     try:
-        msg = await officer.send(
-            f"**Phase {phase_num} endet bald! (Territory Battle)**\n"
-            f"Waehle die Spieler aus, die eine persoenliche Erinnerung erhalten sollen.\n"
-            f"Du hast **1 Stunde** Zeit. Danach wird automatisch eine generische Nachricht gesendet.\n\n"
-            f"*(Spieler in den Dropdowns auswaehlen, dann auf Bestaetigen klicken)*",
-            view=reminder_view,
+        msg = await org_channel.send(
+            reminder_view._content(), view=reminder_view, allowed_mentions=NO_MENTIONS
         )
-        reminder_view.message = msg
-    except discord.Forbidden:
-        print("Officer hat DMs deaktiviert - generische Nachricht wird gesendet")
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"Konnte Auswahl nicht in rote-organisation posten ({e}) - generische Nachricht wird gesendet")
         await send_generic()
         return
+    reminder_view.message = msg
 
-    await reminder_view.wait()
+    await reminder_view.wait_until(
+        PICKER_TIMEOUT,
+        "⏰ Zeit abgelaufen - keine Auswahl getroffen. Die generische Nachricht wurde gesendet.",
+    )
 
     phase_msg = PHASE_END_MESSAGES[phase_index]
 
     if reminder_view.confirmed and reminder_view.selected_ids:
         member_map = {str(m.id): m for m in members}
-        sent, failed_dm = 0, 0
-        reminded = []
+        recipients = [
+            (uid, member_map[uid].display_name, member_map[uid])
+            for uid in reminder_view.selected_ids
+            if uid in member_map
+        ]
+        sent, failed = await send_dms(recipients, phase_msg)
+        record_reminders(stats, sent, tb_index)
 
-        for uid in reminder_view.selected_ids:
-            member = member_map.get(uid)
-            if member:
-                for attempt in range(3):
-                    try:
-                        await member.send(f"{phase_msg}")
-                        sent += 1
-                        reminded.append((uid, member.display_name))
-                        break
-                    except discord.Forbidden:
-                        print(f"Konnte {member.display_name} keine DM senden (DMs deaktiviert)")
-                        failed_dm += 1
-                        break
-                    except discord.DiscordServerError as e:
-                        if attempt < 2:
-                            print(f"Discord 503 beim Senden an {member.display_name}, Versuch {attempt + 1}/3 - warte 5s...")
-                            await asyncio.sleep(5)
-                        else:
-                            print(f"Discord 503 beim Senden an {member.display_name} nach 3 Versuchen - uebersprungen.")
-                            failed_dm += 1
-                    except Exception as e:
-                        print(f"Unerwarteter Fehler beim Senden an {member.display_name}: {e} - uebersprungen.")
-                        failed_dm += 1
-                        break
-
-        record_reminders(stats, reminded, tb_index)
-
-        print(f"Phase {phase_num}: {sent} DMs gesendet, {failed_dm} fehlgeschlagen.")
-        await officer.send(
-            f"Erledigt! **{sent}** Spieler wurden per DM benachrichtigt" +
-            (f", **{failed_dm}** konnten nicht erreicht werden (DMs deaktiviert)." if failed_dm else ".")
-        )
-
-        # ── Platoon-Nachprüfung gegen die Erinnerungsauswahl ───────────────
-        # Wenn während dieser Phase /tbreminder_planets_check gelaufen ist
-        # (siehe _last_checked_planet, gesetzt dort, zurückgesetzt am Anfang
-        # jeder neuen Phase in run_sequence), wird hier automatisch
-        # nachgeprüft, wie viele der ursprünglich verfügbaren Besitzer auch
-        # tatsächlich in der gerade getroffenen Erinnerungsauswahl stecken --
-        # kein separater Befehl nötig, Byproduct des DM-Schritts oben.
-        if _last_checked_planet:
-            reminded_ids = {uid for uid, _ in reminded}
-            try:
-                refined = requirements.compute_shortfall(_last_checked_planet)
-            except roster_read.RosterUnavailableError as e:
-                print(f"Platoon-Nachprüfung übersprungen (Roster nicht erreichbar): {e}")
-            else:
-                refinement_text = format_platoon_refinement(
-                    _last_checked_planet, refined, reminded_ids
-                )
-                for chunk in split_message(refinement_text):
-                    await officer.send(chunk)
+        print(f"Phase {phase_num}: {len(sent)} DMs gesendet, {len(failed)} fehlgeschlagen.")
+        lines = [
+            f"✅ **Phase {phase_num}**: {len(sent)} Spieler per DM erinnert "
+            f"(bestätigt von {reminder_view.actor_name})."
+        ]
+        if sent:
+            lines.append("Erinnert: " + ", ".join(sorted((n for _, n in sent), key=str.lower)))
+        if failed:
+            lines.append(f"⚠️ Nicht erreicht ({len(failed)}): {_format_failed(failed)}")
+        await reminder_view.finalize("\n".join(lines))
     else:
-        reason = "Uebersprungen" if reminder_view._skipped else "Timeout"
+        reason = "Uebersprungen" if reminder_view.skipped else "Timeout"
         print(f"Phase {phase_num}: {reason} - generische Nachricht wird gesendet.")
         await send_generic()
 
     # ── Step 2: Failed-to-set picker (fire and forget) ────────────────────────
     async def send_failed_picker():
         if is_last_phase:
-            failed_timeout = 22 * HOURS
-        elif next_phase_wait > 0:
-            failed_timeout = max(OFFICER_TIMEOUT, next_phase_wait - OFFICER_TIMEOUT)
+            failed_timeout = config.FINAL_FAILED_TIMEOUT
         else:
-            failed_timeout = OFFICER_TIMEOUT
+            # Bis zum nächsten Trigger (dann erscheint die nächste
+            # Erinnerungsauswahl), mindestens 1 h. next_phase_wait ist die
+            # Wartezeit ab Trigger dieser Phase, abzüglich der seitdem
+            # vergangenen Zeit.
+            failed_timeout = max(HOURS, next_phase_wait - (time.monotonic() - started))
         deadline_ts = int(time.time()) + int(failed_timeout)
-        failed_view = FailedSetView(members, timeout=failed_timeout)
-        try:
-            msg = await officer.send(
+        failed_view = FailedSetView(
+            members,
+            header=(
                 f"**Phase {phase_num} - Wer hat NICHT stationiert?**\n"
-                f"Waehle die Spieler aus, die diese Phase nicht stationiert haben.\n"
-                f"Du hast Zeit bis <t:{deadline_ts}:F> (<t:{deadline_ts}:R>).\n\n"
-                f"*(Falls alle stationiert haben, auf 'Alle haben stationiert' klicken)*",
-                view=failed_view,
+                f"Wählt die Spieler aus, die diese Phase nicht stationiert haben, und klickt auf "
+                f"*Bestätigen*. Falls alle stationiert haben: *Alle haben stationiert*.\n"
+                f"Frist: <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)."
+            ),
+        )
+        try:
+            fmsg = await org_channel.send(
+                failed_view._content(), view=failed_view, allowed_mentions=NO_MENTIONS
             )
-            failed_view.message = msg
-        except discord.Forbidden:
-            print("Officer hat DMs deaktiviert - Failed-to-set wird nicht erfasst")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"Konnte Failed-to-set-Auswahl nicht posten ({e}) - wird nicht erfasst")
             if is_last_phase:
-                await send_stats_summary(officer, stats, tb_index)
+                await send_stats_summary(org_channel, stats, tb_index)
             return
+        failed_view.message = fmsg
 
-        await failed_view.wait()
+        await failed_view.wait_until(
+            failed_timeout, "⏰ Zeit abgelaufen - keine Fehlenden eingetragen."
+        )
 
         if failed_view.confirmed and failed_view.selected_ids:
             member_map = {str(m.id): m for m in members}
@@ -429,12 +538,17 @@ async def handle_phase_end(
             ]
             record_failed(stats, failed_list, tb_index)
             print(f"Phase {phase_num}: {len(failed_list)} Spieler als nicht stationiert markiert.")
+            names = ", ".join(sorted((n for _, n in failed_list), key=str.lower))
+            await failed_view.finalize(
+                f"✅ **Phase {phase_num}**: {len(failed_list)} Spieler als nicht stationiert "
+                f"eingetragen (von {failed_view.actor_name}): {names}"
+            )
         else:
-            reason = "Alle haben stationiert" if failed_view._skipped else "Timeout"
+            reason = "Alle haben stationiert" if failed_view.skipped else "Timeout"
             print(f"Phase {phase_num}: {reason} - keine Fehlenden eingetragen.")
 
         if is_last_phase:
-            await send_stats_summary(officer, stats, tb_index)
+            await send_stats_summary(org_channel, stats, tb_index)
 
     asyncio.create_task(send_failed_picker())
 
@@ -557,21 +671,21 @@ def split_message(text: str, limit: int = 1990) -> list[str]:
     return chunks
 
 
-async def send_stats_summary(officer: discord.User, stats: dict, tb_index: int):
-    """DM the officer the stats summary. Called automatically at end of TB."""
+async def send_stats_summary(destination: discord.abc.Messageable, stats: dict, tb_index: int):
+    """Post the stats summary (rote-organisation). Called automatically at end of TB."""
     messages = await build_stats_messages(stats, tb_index)
     for msg in messages:
         for chunk in split_message(msg):
-            await officer.send(chunk)
+            await destination.send(chunk)
 
 
-async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, phase_elapsed: float = 0.0):
+async def run_sequence(tb_channel: discord.TextChannel, start_phase: int = 0, phase_elapsed: float = 0.0):
     """
     Main TB sequence.
     start_phase:    phase index (0-5) to start from. Used by /resume_tb.
     phase_elapsed:  seconds already elapsed in the current phase wait. Used by /resume_tb.
     """
-    global is_running, _last_checked_planet
+    global is_running
     stats = load_stats()
 
     # On resume, reuse the persisted tb_index. On fresh start, derive from record_participation.
@@ -581,7 +695,7 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
         tb_index = get_tb_index(stats)  # will be updated after record_participation
 
     try:
-        guild = tw_channel.guild
+        guild = tb_channel.guild
         role  = guild.get_role(MEMBER_ROLE_ID)
         members = []
         if role:
@@ -599,35 +713,29 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
             else:
                 print("Rolle nicht gefunden oder keine Mitglieder - Teilnahme wird nicht getrackt.")
 
-            await tw_channel.send("@everyone Ein neues Territory Battle hat gestartet!")
+            await tb_channel.send("@everyone Ein neues Territory Battle hat gestartet!")
             print(f"TB-Startnachricht gesendet. (TB #{tb_index + 1} in den Stats)")
         else:
             print(f"TB-Sequenz wird ab Phase {start_phase + 1} fortgesetzt. (TB #{tb_index + 1})")
 
         # Persist run state to disk
         # On resume (start_phase > 0), preserve existing phase_started_at
-        set_current_run(stats, tb_index, start_phase, tw_channel.id, update_timestamp=(start_phase == 0))
+        set_current_run(stats, tb_index, start_phase, tb_channel.id, update_timestamp=(start_phase == 0))
 
         carry_over = 0.0
         for i in range(start_phase, 6):
-            # Neue Wartezeit, neue Phase -- ein zuvor gecachter
-            # /tbreminder_planets_check gehört zur vorherigen Phase und
-            # darf hier nicht mehr als "aktuell" gelten (siehe
-            # handle_phase_end's Nachprüfung unten).
-            _last_checked_planet = None
-
             if i == start_phase and phase_elapsed > 0:
                 # Resume: subtract already-elapsed time from this phase's wait
-                base_wait = 22 * HOURS if i == 0 else 24 * HOURS
+                base_wait = config.trigger_wait(i)
                 wait_seconds = max(0, base_wait - phase_elapsed)
-                print(f"Phase {i + 1}: noch {wait_seconds / HOURS:.2f}h verbleibend (Resumption).")
+                print(f"Phase {i + 1}: noch {wait_seconds / HOURS:.2f}h bis zur Erinnerungsauswahl (Resumption).")
             else:
-                wait_seconds = (22 * HOURS if i == 0 else 24 * HOURS) - carry_over
+                wait_seconds = config.trigger_wait(i) - carry_over
 
-            next_phase_wait = 24 * HOURS if i < 5 else 0
+            next_phase_wait = config.TRIGGER_INTERVAL if i < 5 else 0
             last_phase = (i == 5)
 
-            print(f"Warte {wait_seconds / HOURS:.2f}h bis Phase {i + 1} endet...")
+            print(f"Warte {wait_seconds / HOURS:.2f}h bis zur Erinnerungsauswahl fuer Phase {i + 1}...")
             await asyncio.sleep(max(0, wait_seconds))
 
             if not is_running:
@@ -635,10 +743,10 @@ async def run_sequence(tw_channel: discord.TextChannel, start_phase: int = 0, ph
                 return
 
             # Update persisted phase state before handling
-            set_current_run(stats, tb_index, i + 1, tw_channel.id)
+            set_current_run(stats, tb_index, i + 1, tb_channel.id)
 
             t0 = time.monotonic()
-            await handle_phase_end(i, tw_channel, stats, tb_index, next_phase_wait, last_phase)
+            await handle_phase_end(i, tb_channel, stats, tb_index, next_phase_wait, last_phase)
             carry_over = time.monotonic() - t0
             print(f"Phase {i + 1} Interaktion dauerte {carry_over / 60:.1f} min - wird von naechster Phase abgezogen.")
 
@@ -661,13 +769,15 @@ async def notify_failure(exc: Exception):
     abbricht -- egal ob das den Bot-Prozess selbst mit reißt oder nicht.
     Ohne das: die Exception verschwindet in den Container-Logs (asyncio
     protokolliert "exception was never retrieved" höchstens beim nächsten
-    Garbage-Collect), und in Discord passiert schlicht nichts mehr -- der
-    Officer merkt das erst, wenn die erwartete DM ausbleibt.
+    Garbage-Collect), und in Discord passiert schlicht nichts mehr -- in
+    rote-organisation merkt das erst jemand, wenn die erwartete
+    Auswahl ausbleibt.
 
-    Best effort: schlägt sowohl der Kanal-Post als auch die Officer-DM
-    fehl (z.B. weil der Discord-Gateway selbst die Ursache der Exception
-    war), wird das geloggt, aber nichts weiter unternommen -- es gibt
-    keinen zuverlässigeren Kanal mehr, über den der Bot sich melden könnte.
+    Best effort: schlagen beide Kanal-Posts (TB-Kanal und
+    rote-organisation) fehl (z.B. weil der Discord-Gateway selbst die
+    Ursache der Exception war), wird das geloggt, aber nichts weiter
+    unternommen -- es gibt keinen zuverlässigeren Kanal mehr, über den der
+    Bot sich melden könnte.
     """
     tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     print(f"TB-Sequenz abgestürzt:\n{tb_text}")
@@ -678,17 +788,18 @@ async def notify_failure(exc: Exception):
         f"prüfen und ggf. `/tbreminder_resume` nutzen."
     )
     try:
-        channel = bot.get_channel(TW_CHANNEL_ID)
+        channel = bot.get_channel(TB_CHANNEL_ID)
         if channel:
             await channel.send(message)
     except Exception as notify_exc:
         print(f"Konnte Absturz nicht im Kanal melden: {notify_exc}")
 
     try:
-        officer = await bot.fetch_user(OFFICER_ID)
-        await officer.send(message)
+        org_channel = bot.get_channel(ORG_CHANNEL_ID)
+        if org_channel:
+            await org_channel.send(message)
     except Exception as notify_exc:
-        print(f"Konnte Absturz nicht per DM an Officer melden: {notify_exc}")
+        print(f"Konnte Absturz nicht in rote-organisation melden: {notify_exc}")
 
 
 def launch_run_sequence(*args, **kwargs) -> asyncio.Task:
@@ -728,8 +839,8 @@ async def on_ready():
     await tree.sync(guild=guild)
     print(f"Eingeloggt als {bot.user} (ID: {bot.user.id})")
     print(f"   guild_id    : {GUILD_ID}")
-    print(f"   tw_channel  : {TW_CHANNEL_ID}")
-    print(f"   officer     : {OFFICER_ID}")
+    print(f"   tb_channel  : {TB_CHANNEL_ID}")
+    print(f"   org_channel : {ORG_CHANNEL_ID}")
     print(f"   manager_ids : {MANAGER_IDS or '(keine)'}")
     print(f"   rolle       : {MEMBER_ROLE_ID}")
 
@@ -748,7 +859,7 @@ async def on_ready():
 
     phase = run.get("phase", 0)
     started_at = run.get("phase_started_at")
-    channel_id = run.get("channel_id", TW_CHANNEL_ID)
+    channel_id = run.get("channel_id", TB_CHANNEL_ID)
 
     if not started_at:
         # Kein Zeitstempel vorhanden (z.B. sehr alte stats.json von vor
@@ -774,14 +885,15 @@ async def on_ready():
     if channel is None:
         print(f"Kanal {channel_id} nicht gefunden -- automatische Recovery abgebrochen.")
         try:
-            officer = await bot.fetch_user(OFFICER_ID)
-            await officer.send(
-                f"⚠️ TB-Reminder wurde neu gestartet und hat eine unterbrochene Sequenz "
-                f"gefunden (Phase {phase}), konnte den TB-Kanal (`{channel_id}`) aber "
-                f"nicht finden. Bitte `/tbreminder_resume` manuell ausführen."
-            )
+            org_channel = bot.get_channel(ORG_CHANNEL_ID)
+            if org_channel:
+                await org_channel.send(
+                    f"⚠️ TB-Reminder wurde neu gestartet und hat eine unterbrochene Sequenz "
+                    f"gefunden (Phase {phase}), konnte den TB-Kanal (`{channel_id}`) aber "
+                    f"nicht finden. Bitte `/tbreminder_resume` manuell ausführen."
+                )
         except Exception as notify_exc:
-            print(f"Konnte Officer nicht benachrichtigen: {notify_exc}")
+            print(f"Konnte rote-organisation nicht benachrichtigen: {notify_exc}")
         return
 
     resume_message = (
@@ -795,10 +907,11 @@ async def on_ready():
         print(f"Konnte Kanal nicht benachrichtigen: {notify_exc}")
 
     try:
-        officer = await bot.fetch_user(OFFICER_ID)
-        await officer.send(resume_message)
+        org_channel = bot.get_channel(ORG_CHANNEL_ID)
+        if org_channel:
+            await org_channel.send(resume_message)
     except Exception as notify_exc:
-        print(f"Konnte Officer nicht per DM benachrichtigen: {notify_exc}")
+        print(f"Konnte rote-organisation nicht benachrichtigen: {notify_exc}")
 
     is_running = True
     running_task = launch_run_sequence(channel, start_phase=phase, phase_elapsed=float(elapsed))
@@ -821,10 +934,10 @@ async def start(interaction: discord.Interaction):
         )
         return
 
-    channel = bot.get_channel(TW_CHANNEL_ID)
+    channel = bot.get_channel(TB_CHANNEL_ID)
     if channel is None:
         await interaction.response.send_message(
-            f"Kanal mit ID `{TW_CHANNEL_ID}` nicht gefunden. Bitte `.env` pruefen.",
+            f"Kanal mit ID `{TB_CHANNEL_ID}` nicht gefunden. Bitte `.env` pruefen.",
             ephemeral=True,
         )
         return
@@ -858,7 +971,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
 
     if pending_timer and not pending_timer.done():
         await interaction.response.send_message(
-            "Es laeuft bereits ein Timer! Nutze `/cancel_tb` um ihn abzubrechen.",
+            "Es laeuft bereits ein Timer! Nutze `/tbreminder_cancel` um ihn abzubrechen.",
             ephemeral=True,
         )
         return
@@ -883,10 +996,10 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
         )
         return
 
-    channel = bot.get_channel(TW_CHANNEL_ID)
+    channel = bot.get_channel(TB_CHANNEL_ID)
     if channel is None:
         await interaction.response.send_message(
-            f"Kanal mit ID `{TW_CHANNEL_ID}` nicht gefunden. Bitte `.env` pruefen.",
+            f"Kanal mit ID `{TB_CHANNEL_ID}` nicht gefunden. Bitte `.env` pruefen.",
             ephemeral=True,
         )
         return
@@ -961,7 +1074,7 @@ async def start_tb_timer(interaction: discord.Interaction, start_time: str):
 @tree.command(name="tbreminder_resume", description="Setzt eine unterbrochene TB-Sequenz fort")
 @app_commands.describe(
     phase="Phase bei der fortgesetzt wird (1-6, welche Phase als naechstes endet)",
-    hours_elapsed="Wie viele Stunden der aktuellen Wartezeit bereits vergangen sind (optional, wird aus gespeichertem Status berechnet)"
+    hours_elapsed="Stunden seit dem letzten Trigger bzw. TB-Start (optional, wird aus gespeichertem Status berechnet)"
 )
 async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed: float = 0.0):
     if not is_authorized(interaction):
@@ -994,22 +1107,22 @@ async def resume_tb(interaction: discord.Interaction, phase: int, hours_elapsed:
         hours_elapsed = (int(time.time()) - run["phase_started_at"]) / HOURS
         print(f"Elapsed time aus gespeichertem Status: {hours_elapsed:.2f}h")
 
-    channel = bot.get_channel(TW_CHANNEL_ID)
+    channel = bot.get_channel(TB_CHANNEL_ID)
     if channel is None:
         await interaction.response.send_message(
-            f"Kanal mit ID `{TW_CHANNEL_ID}` nicht gefunden.",
+            f"Kanal mit ID `{TB_CHANNEL_ID}` nicht gefunden.",
             ephemeral=True,
         )
         return
 
     phase_index = phase - 1
     elapsed_seconds = hours_elapsed * HOURS
-    base_wait = 22 * HOURS if phase_index == 0 else 24 * HOURS
+    base_wait = config.trigger_wait(phase_index)
     remaining = max(0, base_wait - elapsed_seconds)
 
     await interaction.response.send_message(
         f"TB-Sequenz wird ab Phase {phase} fortgesetzt.\n"
-        f"Verbleibende Wartezeit fuer diese Phase: **{remaining / HOURS:.1f}h**\n"
+        f"Verbleibende Wartezeit bis zur Erinnerungsauswahl: **{remaining / HOURS:.1f}h**\n"
         f"Nachrichten gehen in {channel.mention}.",
         ephemeral=True,
     )
@@ -1117,7 +1230,7 @@ async def cancel_tb(interaction: discord.Interaction):
 
 
 
-@tree.command(name="tbreminder_status", description="Zeigt den aktuellen TB-Status: Phasenbeginn, Erinnerungszeit, Phasenende")
+@tree.command(name="tbreminder_status", description="Zeigt den aktuellen TB-Status: Phasenbeginn, Erinnerungsauswahl, Phasenende")
 async def tb_status(interaction: discord.Interaction):
     if not is_authorized(interaction):
         await interaction.response.send_message(
@@ -1147,17 +1260,31 @@ async def tb_status(interaction: discord.Interaction):
         )
         return
 
-    phase_duration = 22 * HOURS if phase == 0 else 24 * HOURS
-    phase_end_ts   = started_at + int(phase_duration)
-    reminder_ts    = phase_end_ts - int(OFFICER_TIMEOUT)  # officer DM fires 1h before phase end
+    # current_run["phase"] ist der Index (0-5) der Phase, deren Trigger als
+    # nächstes feuert; phase_started_at ist der Zeitpunkt des vorherigen
+    # Triggers bzw. des TB-Starts (siehe run_sequence / set_current_run).
+    if phase >= config.PHASE_COUNT:
+        await interaction.response.send_message(
+            f"**TB #{tb_index + 1}** - alle Phasen sind durch, die letzte Fehlend-Auswahl "
+            f"bzw. der Abschlussbericht laeuft noch.",
+            ephemeral=True,
+        )
+        return
 
-    phase_num = phase + 1  # phase in current_run is the last completed phase, so next is phase+1
+    trigger_ts   = started_at + config.trigger_wait(phase)
+    phase_end_ts = trigger_ts + config.PLAYER_REMINDER_OFFSET
+    generic_ts   = phase_end_ts - config.GENERIC_REMINDER_OFFSET
+    # Phase 1 beginnt mit dem TB-Start; jede spätere Phase beginnt zum Ende
+    # der vorherigen = vorheriger Trigger + PLAYER_REMINDER_OFFSET.
+    phase_start_ts = started_at if phase == 0 else started_at + config.PLAYER_REMINDER_OFFSET
 
     await interaction.response.send_message(
-        f"**TB #{tb_index + 1} - Phase {phase_num} laeuft**\n\n"
-        f"Phase gestartet:        <t:{started_at}:F>\n"
-        f"Officer wird erinnert:  <t:{reminder_ts}:F> (<t:{reminder_ts}:R>)\n"
-        f"Phase endet:            <t:{phase_end_ts}:F> (<t:{phase_end_ts}:R>)",
+        f"**TB #{tb_index + 1} - Phase {phase + 1} laeuft**\n\n"
+        f"Phase gestartet:            <t:{phase_start_ts}:F>\n"
+        f"Spielerauswahl (rote-org.): <t:{trigger_ts}:F> (<t:{trigger_ts}:R>)\n"
+        f"Generische Erinnerung*:     <t:{generic_ts}:F>\n"
+        f"Phase endet:                <t:{phase_end_ts}:F> (<t:{phase_end_ts}:R>)\n\n"
+        f"-# * nur, wenn bis dahin niemand die Auswahl bestaetigt hat",
         ephemeral=True,
     )
 
@@ -1243,28 +1370,6 @@ def format_platoon_report(planet: str, rows: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def format_platoon_refinement(planet: str, rows: list[dict], reminded_ids: set[str]) -> str:
-    """
-    Automatische Phasenend-Nachprüfung (siehe handle_phase_end): dieselben
-    Zeilen wie format_platoon_report(), aber gefiltert auf Besitzer, deren
-    discord_id in der gerade getroffenen Erinnerungsauswahl steckt --
-    "wer ist von den ursprünglich verfügbaren Besitzern auch tatsächlich
-    noch als aktiv markiert".
-    """
-    lines = [f"📋 {planet} — Nachgeprüft gegen deine Auswahl\n"]
-    for row in rows:
-        available = [o for o in row["owners"] if o["discord_id"] in reminded_ids]
-        marker = "⚠️" if len(available) < row["required_count"] else "✅"
-        if len(available) < row["required_count"]:
-            lines.append(
-                f"{marker} {row['unit_name']}: nur noch {len(available)} von "
-                f"{len(row['owners'])} verfügbaren Besitzern in deiner Auswahl"
-            )
-        else:
-            lines.append(f"{marker} {row['unit_name']}: weiterhin ausreichend gedeckt")
-    return "\n".join(lines).rstrip()
-
-
 def _build_ping_content(context_line: str, owners: list) -> str | None:
     """
     Gemeinsamer Ping-Text-Baustein für alle drei Ping-Views. Registrierte
@@ -1285,12 +1390,11 @@ def _build_ping_content(context_line: str, owners: list) -> str | None:
         return None
 
     mentions = [f"<@{o['discord_id']}>" for o in owners if o["discord_id"]]
-    # Namensbasierte Deduplizierung -- roster_read.get_owners_of_unit()
-    # liefert keine ally_code-Spalte zurück, daher kein exakterer
-    # Schlüssel verfügbar. Restrisiko: zwei Gildenmitglieder mit
-    # identischem Ingame-Namen würden hier fälschlich zusammengelegt --
-    # in der Praxis selten genug, um für diesen Zweck (wer muss manuell
-    # informiert werden) hinnehmbar zu sein.
+    # Namensbasierte Deduplizierung (roster_read liefert inzwischen auch
+    # ally_code, aber die Anzeige hier ist ohnehin der Name). Restrisiko:
+    # zwei Gildenmitglieder mit identischem Ingame-Namen würden hier
+    # fälschlich zusammengelegt -- in der Praxis selten genug, um für
+    # diesen Zweck (wer muss manuell informiert werden) hinnehmbar zu sein.
     unregistered = sorted({o["player_name"] for o in owners if not o["discord_id"]})
 
     parts = []
@@ -1300,6 +1404,32 @@ def _build_ping_content(context_line: str, owners: list) -> str | None:
         parts.append(f"Nicht registriert, bitte manuell informieren: {', '.join(unregistered)}")
     parts.append(context_line)
     return "\n".join(parts)
+
+
+# ── Ping-Ziel: TB-Kanal ────────────────────────────────────────────────────
+# Auswahl und Bedienung passieren in rote-organisation, der eigentliche Ping
+# landet aber im TB-Kanal (TB_CHANNEL_ID), wo die Spieler ihn sehen.
+
+async def post_ping(interaction: discord.Interaction, content: str) -> bool:
+    """Postet content in den TB-Kanal und quittiert dem Klickenden ephemer.
+    True bei Erfolg, sonst False (Fehlermeldung ist dann schon gesendet)."""
+    channel = bot.get_channel(TB_CHANNEL_ID)
+    if channel is None:
+        await interaction.response.send_message(
+            f"TB-Kanal (`{TB_CHANNEL_ID}`) nicht gefunden.", ephemeral=True
+        )
+        return False
+    try:
+        await channel.send(content)
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"Ping konnte nicht gesendet werden: {e}", ephemeral=True
+        )
+        return False
+    await interaction.response.send_message(
+        f"📣 Gepingt in {channel.mention}.", ephemeral=True
+    )
+    return True
 
 
 class PlatoonPingView(discord.ui.View):
@@ -1320,6 +1450,9 @@ class PlatoonPingView(discord.ui.View):
     dafür unabhängig von einer bestimmten Buttons-Nachricht funktionieren,
     nicht an eine einzelne von mehreren PlatoonPingView-Instanzen gebunden
     sein.
+
+    Der Ping selbst geht in den TB-Kanal (siehe post_ping()), der Klickende
+    bekommt nur eine ephemere Bestätigung.
     """
 
     def __init__(self, planet: str, rows: list[dict]):
@@ -1343,7 +1476,8 @@ class PlatoonPingView(discord.ui.View):
                     f"Niemand besitzt {row['unit_name']}.", ephemeral=True
                 )
                 return
-            await interaction.response.send_message(content)
+            if not await post_ping(interaction, content):
+                return
             btn.disabled = True
             await interaction.message.edit(view=self)
 
@@ -1357,7 +1491,7 @@ class AllUnitsPingView(discord.ui.View):
     Planeten, unabhängig davon, auf wie viele PlatoonPingView-Nachrichten
     die Einzel-Buttons verteilt sind (siehe dortige Docstring). Kein
     Tracking gegen Doppel-Pings über die Einzel-Buttons hinweg (bewusst
-    einfache Variante, siehe Chat-Verlauf).
+    einfache Variante, siehe Chat-Verlauf). Ping geht in den TB-Kanal.
     """
 
     def __init__(self, planet: str, all_rows: list[dict]):
@@ -1388,37 +1522,163 @@ class AllUnitsPingView(discord.ui.View):
             )
             return
 
-        await interaction.response.send_message(content)
+        if not await post_ping(interaction, content):
+            return
         button.disabled = True
         await interaction.message.edit(view=self)
 
 
-class UnitPingView(discord.ui.View):
+UNIT_VIEW_TIMEOUT = 14 * 60  # ephemere Nachricht: Interaction-Token gilt 15 min
+
+
+class UnitSelectView(MultiSelectView):
     """
-    Einzelner Ping-Button für /tbreminder_units_ping -- ad-hoc, eine
-    Einheit, ein Ergebnis. Einfacher als PlatoonPingView (kein
-    "Alle pingen" nötig, da es nur eine Einheit gibt), gleiches
-    Prinzip: einmalig auslösbar, kein Officer-Timeout.
+    Besitzer-Auswahl für /tbreminder_units_check und /tbreminder_units_ping:
+    aus den Besitzern einer Einheit gezielt die auswählen, die noch
+    stationieren sollen (wer schon stationiert hat, sieht man nur im Spiel),
+    und dann entweder im TB-Kanal pingen oder per DM anschreiben.
+
+    Ephemer, nur für den Aufrufer -- deshalb kein Mehrbediener-Problem und
+    kein Rauschen in rote-organisation. Option-Wert ist der Ally-Code, nicht
+    die Discord-ID: auch nicht registrierte Besitzer (discord_id leer) sind
+    auswählbar; _build_ping_content() nennt sie dann als Klartext-Name.
+
+    DMs werden bewusst NICHT in stats.json gezählt -- die Erinnerungsquote
+    dort setzt maximal 6 Erinnerungen pro TB voraus (build_stats_messages).
+
+    Nach einem DM-Versand schrumpft die Auswahl auf die NICHT erreichten
+    Spieler, damit "Im Kanal pingen" direkt der Fallback für genau diese ist.
     """
 
-    def __init__(self, unit_name: str, owners: list, is_ship: bool):
-        super().__init__(timeout=None)
-        self.unit_name = unit_name
-        self.owners = owners
+    def __init__(
+        self,
+        unit: str,
+        relic: int,
+        owners: list,
+        is_ship: bool,
+        lookup_text: str,
+        *,
+        preselect_all: bool,
+    ):
+        items = []
+        for o in owners:
+            label = o["player_name"] or o["ally_code"]
+            if not is_ship:
+                label = f"{label} (R{config.relic_tier_to_display(o['relic_tier'])})"
+            description = None if o["discord_id"] else "nicht registriert (kein Discord-Link)"
+            items.append((o["ally_code"], label, description))
+
+        super().__init__(
+            items,
+            header=lookup_text + "\n\n*Besitzer auswählen, dann im TB-Kanal pingen oder per DM anschreiben.*",
+            noun="Besitzer",
+            show_names=False,
+            preselected={o["ally_code"] for o in owners} if preselect_all else None,
+            timeout=UNIT_VIEW_TIMEOUT,
+        )
+        self.unit = unit
+        self.relic = relic
         self.is_ship = is_ship
+        self.owners = {o["ally_code"]: o for o in owners}
+        self.origin: discord.Interaction | None = None
 
-    @discord.ui.button(label="Pingen", style=discord.ButtonStyle.primary)
-    async def ping(self, interaction: discord.Interaction, button: discord.ui.Button):
-        context_line = f"Bitte für **{self.unit_name}** bereithalten."
-        content = _build_ping_content(context_line, self.owners)
-        if content is None:
+        self.ping_btn = discord.ui.Button(label="Im Kanal pingen", style=discord.ButtonStyle.primary)
+        self.ping_btn.callback = self._on_ping
+        self.add_item(self.ping_btn)
+
+        self.dm_btn = discord.ui.Button(label="Per DM senden", style=discord.ButtonStyle.secondary)
+        self.dm_btn.callback = self._on_dm
+        self.add_item(self.dm_btn)
+
+    def _selected_owners(self) -> list:
+        return [self.owners[k] for k in self.selected_ids if k in self.owners]
+
+    @staticmethod
+    def _name(owner) -> str:
+        return owner["player_name"] or owner["ally_code"]
+
+    def _dm_text(self) -> str:
+        if self.is_ship or not self.relic:
+            return f"Bitte stationiere **{self.unit}** im Territory Battle - wird noch gebraucht."
+        return (
+            f"Bitte stationiere **{self.unit}** (Relic {self.relic}+) im Territory Battle "
+            f"- wird noch gebraucht."
+        )
+
+    async def _on_ping(self, interaction: discord.Interaction):
+        if not self.selected_ids:
             await interaction.response.send_message(
-                f"Niemand besitzt {self.unit_name}.", ephemeral=True
+                "Erst mindestens einen Besitzer auswählen.", ephemeral=True
             )
             return
-        await interaction.response.send_message(content)
-        button.disabled = True
-        await interaction.message.edit(view=self)
+        owners = self._selected_owners()
+        content = _build_ping_content(f"Bitte für **{self.unit}** bereithalten.", owners)
+        channel = bot.get_channel(TB_CHANNEL_ID)
+        if content is None or channel is None:
+            await interaction.response.send_message(
+                f"TB-Kanal (`{TB_CHANNEL_ID}`) nicht gefunden.", ephemeral=True
+            )
+            return
+        try:
+            await channel.send(content)
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"Ping konnte nicht gesendet werden: {e}", ephemeral=True
+            )
+            return
+
+        self.ping_btn.disabled = True
+        names = ", ".join(sorted((self._name(o) for o in owners), key=str.lower))
+        self.status_lines.append(f"📣 Gepingt in {channel.mention}: {names}")
+        await interaction.response.edit_message(content=self._content(), view=self)
+
+    async def _on_dm(self, interaction: discord.Interaction):
+        if not self.selected_ids:
+            await interaction.response.send_message(
+                "Erst mindestens einen Besitzer auswählen.", ephemeral=True
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "DMs lassen sich nur vom Server aus versenden.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        recipients = []
+        failed: list[tuple[str, str, str]] = []
+        for o in self._selected_owners():
+            if not o["discord_id"]:
+                failed.append((o["ally_code"], self._name(o), "nicht registriert"))
+                continue
+            member = interaction.guild.get_member(int(o["discord_id"]))
+            recipients.append((o["ally_code"], self._name(o), member))
+
+        sent, send_failed = await send_dms(recipients, self._dm_text())
+        failed += send_failed
+
+        self.dm_btn.disabled = True
+        if sent:
+            self.status_lines.append(
+                "✉️ DM gesendet an: " + ", ".join(sorted((n for _, n in sent), key=str.lower))
+            )
+        if failed:
+            self.status_lines.append(
+                f"⚠️ Nicht erreicht: {_format_failed(failed)} - Auswahl auf diese "
+                f"reduziert, *Im Kanal pingen* erreicht sie im TB-Kanal."
+            )
+        self.selected_ids = {key for key, _, _ in failed}
+        self._sync_defaults()
+        await interaction.edit_original_response(content=self._content(), view=self)
+
+    async def on_timeout(self):
+        if self.origin is None:
+            return
+        try:
+            await self.origin.edit_original_response(view=None)
+        except Exception:
+            pass
 
 
 class ConfirmReplaceView(discord.ui.View):
@@ -1516,11 +1776,8 @@ async def requirements_upload(interaction: discord.Interaction, file: discord.At
 @app_commands.describe(planet="Planet, wie in der Anforderungsliste hinterlegt")
 @app_commands.autocomplete(planet=planet_autocomplete)
 async def planets_check(interaction: discord.Interaction, planet: str):
-    if not is_authorized(interaction):
-        await interaction.response.send_message(
-            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
-            ephemeral=True,
-        )
+    if not can_use_org_commands(interaction):
+        await deny_org_only(interaction)
         return
 
     rows = requirements.get_planet_requirements(planet)
@@ -1540,9 +1797,6 @@ async def planets_check(interaction: discord.Interaction, planet: str):
         await interaction.followup.send(f"Rosterdaten nicht erreichbar: {e}")
         return
 
-    global _last_checked_planet
-    _last_checked_planet = planet
-
     text = format_platoon_report(planet, shortfall_rows)
     for chunk in split_message(text):
         await interaction.followup.send(chunk)
@@ -1555,11 +1809,8 @@ async def planets_check(interaction: discord.Interaction, planet: str):
 @app_commands.describe(planet="Planet, wie in der Anforderungsliste hinterlegt")
 @app_commands.autocomplete(planet=planet_autocomplete)
 async def planets_ping(interaction: discord.Interaction, planet: str):
-    if not is_authorized(interaction):
-        await interaction.response.send_message(
-            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
-            ephemeral=True,
-        )
+    if not can_use_org_commands(interaction):
+        await deny_org_only(interaction)
         return
 
     rows = requirements.get_planet_requirements(planet)
@@ -1653,9 +1904,37 @@ async def _lookup_unit(unit: str, relic: int):
     return lines, owners, is_ship
 
 
+async def _run_unit_command(
+    interaction: discord.Interaction, unit: str, relic: int, *, preselect_all: bool
+):
+    """Gemeinsamer Ablauf für /tbreminder_units_check und _ping: Besitzer
+    nachschlagen und als ephemere Auswahl (UnitSelectView) anzeigen. Der
+    Unterschied der beiden Befehle ist nur, ob zu Beginn niemand oder alle
+    Besitzer vorausgewählt sind."""
+    if not can_use_org_commands(interaction):
+        await deny_org_only(interaction)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    lines, owners, is_ship = await _lookup_unit(unit, relic)
+    if owners is None:
+        await interaction.followup.send(lines, ephemeral=True)  # lines is the error text here
+        return
+    if not owners:
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    view = UnitSelectView(
+        unit, relic, owners, is_ship, "\n".join(lines), preselect_all=preselect_all
+    )
+    await interaction.followup.send(view._content(), view=view, ephemeral=True)
+    view.origin = interaction
+
+
 @tree.command(
     name="tbreminder_units_check",
-    description="Zeigt Besitzer einer Einheit ab einem Relic-Level (diagnostisch, keine Ping-Buttons)",
+    description="Besitzer einer Einheit ab einem Relic-Level nachschlagen, gezielt auswählen und pingen/anschreiben",
 )
 @app_commands.describe(
     unit="Einheit (nur was mindestens ein Gildenmitglied laut Roster besitzt)",
@@ -1667,26 +1946,12 @@ async def units_check(
     unit: str,
     relic: app_commands.Range[int, 0, 20] = 0,
 ):
-    if not is_authorized(interaction):
-        await interaction.response.send_message(
-            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer()
-
-    lines, owners, is_ship = await _lookup_unit(unit, relic)
-    if owners is None:
-        await interaction.followup.send(lines)  # lines is the error text here
-        return
-
-    await interaction.followup.send("\n".join(lines))
+    await _run_unit_command(interaction, unit, relic, preselect_all=False)
 
 
 @tree.command(
     name="tbreminder_units_ping",
-    description="Zeigt und pingt Besitzer einer Einheit ab einem Relic-Level (unabhängig von der Anforderungsliste)",
+    description="Wie units_check, aber alle Besitzer sind vorausgewählt (Auswahl lässt sich anpassen)",
 )
 @app_commands.describe(
     unit="Einheit (nur was mindestens ein Gildenmitglied laut Roster besitzt)",
@@ -1698,22 +1963,7 @@ async def units_ping(
     unit: str,
     relic: app_commands.Range[int, 0, 20] = 0,
 ):
-    if not is_authorized(interaction):
-        await interaction.response.send_message(
-            "Du benoatigst Administrator-Rechte oder Officer-Status fuer diesen Befehl.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer()
-
-    lines, owners, is_ship = await _lookup_unit(unit, relic)
-    if owners is None:
-        await interaction.followup.send(lines)  # lines is the error text here
-        return
-
-    view = UnitPingView(unit, owners, is_ship)
-    await interaction.followup.send("\n".join(lines), view=view)
+    await _run_unit_command(interaction, unit, relic, preselect_all=True)
 
 
 @tree.command(name="tbreminder_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
@@ -1723,8 +1973,12 @@ async def help_command(interaction: discord.Interaction):
 
         "### 🟢 TB starten\n"
         "**`/tbreminder_start`**\n"
-        "Startet die TB-Sequenz sofort. Der Bot kuendigt den TB-Start im konfigurierten Kanal an "
-        "und kontaktiert den Officer automatisch am Ende jeder Phase.\n\n"
+        "Startet die TB-Sequenz sofort. Der Bot kuendigt den TB-Start im TB-Kanal an. "
+        "4 Stunden vor jedem Phasenende postet er in rote-organisation die "
+        "Spielerauswahl: dort kann jeder die Spieler auswaehlen, die eine persoenliche "
+        "DM-Erinnerung bekommen, und bestaetigen. Ohne Bestaetigung geht 1 Stunde vor "
+        "Phasenende die generische Erinnerung an alle in den TB-Kanal. Danach folgt "
+        "die Auswahl 'Wer hat NICHT stationiert?'.\n\n"
 
         "**`/tbreminder_timer start_time: DD.MM.YYYY HH:MM`**\n"
         "Plant den TB-Start zu einem bestimmten Zeitpunkt (Serverzeit).\n"
@@ -1735,12 +1989,13 @@ async def help_command(interaction: discord.Interaction):
         "**`/tbreminder_resume phase: <1-6> [hours_elapsed: <Stunden>]`**\n"
         "Setzt eine unterbrochene TB-Sequenz fort (z.B. nach Server-Neustart).\n"
         "`phase` = welche Phase als naechstes endet.\n"
-        "`hours_elapsed` = wie viele Stunden der aktuellen Wartezeit bereits vergangen sind. "
+        "`hours_elapsed` = Stunden seit dem letzten Trigger bzw. TB-Start. "
         "Wird automatisch aus dem gespeicherten Status berechnet, falls vorhanden.\n"
         "Beispiel: `/tbreminder_resume phase: 6 hours_elapsed: 19.5`\n\n"
 
         "**`/tbreminder_status`**\n"
-        "Zeigt den aktuellen TB-Status: wann die Phase gestartet ist, wann der Officer erinnert wird, wann die Phase endet.\n\n"
+        "Zeigt den aktuellen TB-Status: Phasenbeginn, Zeitpunkt der Spielerauswahl, "
+        "generische Erinnerung, Phasenende.\n\n"
 
         "### 📊 Ergebnisse\n"
         "**`/tbreminder_results`**\n"
@@ -1751,34 +2006,36 @@ async def help_command(interaction: discord.Interaction):
         "**`/tbreminder_cancel`**\n"
         "Bricht einen laufenden Timer oder eine aktive TB-Sequenz ab.\n\n"
 
-        "### 🪖 Platoons\n"
-        "**`/tbreminder_requirements_upload file`**\n"
-        "Lädt die Platoon-Anforderungsliste hoch (CSV: planet, unit_name, "
+        "### 🪖 Platoons (in rote-organisation fuer alle nutzbar)\n"
+        "**`/tbreminder_requirements_upload file`** *(Admin/Manager)*\n"
+        "Laedt die Platoon-Anforderungsliste hoch (CSV: planet, unit_name, "
         "required_count, required_relic). Ersetzt eine bestehende Liste "
-        "vollständig, mit Bestätigung und automatischem Backup.\n\n"
+        "vollstaendig, mit Bestaetigung und automatischem Backup.\n\n"
 
         "**`/tbreminder_planets_check planet`**\n"
-        "Zeigt Fehlbestand pro Einheit für einen Planeten -- diagnostisch, "
+        "Zeigt Fehlbestand pro Einheit fuer einen Planeten -- diagnostisch, "
         "keine Ping-Buttons.\n\n"
 
         "**`/tbreminder_planets_ping planet`**\n"
-        "Ruft alle Besitzer der benötigten Einheiten eines Planeten zur "
-        "Teilnahme auf, mit einem Ping-Button pro Einheit plus 'Alle pingen'.\n\n"
+        "Wie planets_check, mit Ping-Button pro Einheit plus 'Alle pingen'. "
+        "Der Ping erscheint im TB-Kanal.\n\n"
 
         "**`/tbreminder_units_check unit relic`**\n"
-        "Zeigt alle Besitzer einer bestimmten Einheit ab einem Relic-Level -- "
-        "diagnostisch, unabhängig von der Anforderungsliste. Relic-Angabe "
-        "wird bei Schiffen ignoriert.\n\n"
+        "Zeigt alle Besitzer einer Einheit ab einem Relic-Level. Aus der Liste "
+        "koennen gezielt Spieler ausgewaehlt und dann im TB-Kanal gepingt oder per "
+        "DM ('Bitte stationiere ...') angeschrieben werden. Nur fuer dich sichtbar. "
+        "Relic-Angabe wird bei Schiffen ignoriert.\n\n"
 
         "**`/tbreminder_units_ping unit relic`**\n"
-        "Wie `/tbreminder_units_check`, zusätzlich mit Ping-Button für die "
-        "gefundenen Besitzer.\n\n"
+        "Wie `/tbreminder_units_check`, aber alle Besitzer sind vorausgewaehlt.\n\n"
 
         "### ℹ️ Sonstiges\n"
         "**`/tbreminder_help`**\n"
         "Zeigt diese Uebersicht.\n\n"
 
-        "-# Alle Befehle erfordern Administrator-Rechte oder Officer-Status."
+        "-# TB-Ablaufsteuerung (start, timer, resume, status, results, cancel, "
+        "requirements_upload) erfordert Administrator-Rechte oder Manager-Status. "
+        "Platoon-/Unit-Befehle: alle in rote-organisation, Admins/Manager ueberall."
     )
     await interaction.response.send_message(help_text, ephemeral=True)
 
