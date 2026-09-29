@@ -495,6 +495,17 @@ async def handle_phase_end(
         await send_generic()
 
     # ── Step 2: Failed-to-set picker (fire and forget) ────────────────────────
+    # Kandidaten: nur die in Step 1 ausgewählten Spieler (unabhängig davon, ob
+    # die DM zugestellt wurde -- ausgewählt heißt "stand auf der Liste").
+    # Ohne Bestätigung (Skip/Timeout) gibt es keine Auswahl, die generische
+    # Nachricht ging an alle -> dann bleibt die volle Mitgliederliste.
+    if reminder_view.confirmed and reminder_view.selected_ids:
+        failed_candidates = [m for m in members if str(m.id) in reminder_view.selected_ids]
+        candidates_note = "Zur Auswahl stehen nur die in der Erinnerungsauswahl gewählten Spieler.\n"
+    else:
+        failed_candidates = members
+        candidates_note = ""
+
     async def send_failed_picker():
         if is_last_phase:
             failed_timeout = config.FINAL_FAILED_TIMEOUT
@@ -506,9 +517,10 @@ async def handle_phase_end(
             failed_timeout = max(HOURS, next_phase_wait - (time.monotonic() - started))
         deadline_ts = int(time.time()) + int(failed_timeout)
         failed_view = FailedSetView(
-            members,
+            failed_candidates,
             header=(
                 f"**Phase {phase_num} - Wer hat NICHT stationiert?**\n"
+                f"{candidates_note}"
                 f"Wählt die Spieler aus, die diese Phase nicht stationiert haben, und klickt auf "
                 f"*Bestätigen*. Falls alle stationiert haben: *Alle haben stationiert*.\n"
                 f"Frist: <t:{deadline_ts}:F> (<t:{deadline_ts}:R>)."
@@ -530,7 +542,7 @@ async def handle_phase_end(
         )
 
         if failed_view.confirmed and failed_view.selected_ids:
-            member_map = {str(m.id): m for m in members}
+            member_map = {str(m.id): m for m in failed_candidates}
             failed_list = [
                 (uid, member_map[uid].display_name)
                 for uid in failed_view.selected_ids

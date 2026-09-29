@@ -15,7 +15,7 @@ T = Phasenende (Phasen dauern 24 h). Die Offsets stehen in `config.py` (`PLAYER_
 | ↳ bestätigt | DMs an die Ausgewählten | `Phase N endet bald!`. Die Nachricht in `rote-organisation` wird zum Ergebnis umgeschrieben, inkl. **Namen und Grund** derer, die nicht erreicht wurden. Keine generische Nachricht. |
 | ↳ „Überspringen" | TB-Kanal | sofort `@everyone Bitte denkt dran im Territory Battle zu stationieren!` |
 | ↳ keine Bestätigung bis T − 1 h | TB-Kanal | dieselbe generische Nachricht |
-| direkt danach | `rote-organisation` | „Wer hat NICHT stationiert?"-Auswahl, Frist bis zum nächsten Trigger (nach Phase 6: 22 h) |
+| direkt danach | `rote-organisation` | „Wer hat NICHT stationiert?"-Auswahl, Frist bis zum nächsten Trigger (nach Phase 6: 22 h). Nach Bestätigung enthält sie nur die zuvor zur Erinnerung ausgewählten Spieler, nach „Überspringen"/Timeout alle. |
 | nach Phase 6 | `rote-organisation` | TB-Abschlussbericht (Erinnerungen + Fehlende) |
 
 Die Frist der Auswahl (3 h) ist hart: ein Klick kurz vor Fristende verlängert sie nicht.
