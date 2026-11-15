@@ -2049,7 +2049,28 @@ async def help_command(interaction: discord.Interaction):
         "requirements_upload) erfordert Administrator-Rechte oder Manager-Status. "
         "Platoon-/Unit-Befehle: alle in rote-organisation, Admins/Manager ueberall."
     )
-    await interaction.response.send_message(help_text, ephemeral=True)
+    # Discord-Limit 2000 Zeichen: abschnittsweise (### ...) zu Nachrichten packen,
+    # damit kein Befehl von seiner Beschreibung getrennt wird. Ein einzelner zu
+    # langer Abschnitt wird zeilenweise ueber split_message() geteilt.
+    parts = help_text.split("\n\n### ")
+    sections = [parts[0]] + ["### " + p for p in parts[1:]]
+    chunks: list[str] = []
+    current = ""
+    for section in sections:
+        candidate = f"{current}\n\n{section}" if current else section
+        if len(candidate) <= 1990:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = section
+    if current:
+        chunks.append(current)
+    chunks = [piece for chunk in chunks for piece in split_message(chunk)]
+
+    await interaction.response.send_message(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
 
 
 bot.run(TOKEN)
