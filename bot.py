@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 import os
@@ -10,6 +10,7 @@ from datetime import datetime
 import config
 import roster_read
 import requirements
+import platoon_assignments as platoons
 from stats import (
     load_stats,
     save_stats,
@@ -733,6 +734,9 @@ async def run_sequence(tb_channel: discord.TextChannel, start_phase: int = 0, ph
         # Persist run state to disk
         # On resume (start_phase > 0), preserve existing phase_started_at
         set_current_run(stats, tb_index, start_phase, tb_channel.id, update_timestamp=(start_phase == 0))
+        # Phase 1 öffnet mit dem TB-Start: Platoon-DMs nicht erst beim
+        # nächsten Schleifendurchlauf (bis 60 s) verschicken.
+        asyncio.create_task(dispatch_platoon_dms())
 
         carry_over = 0.0
         for i in range(start_phase, 6):
@@ -763,6 +767,9 @@ async def run_sequence(tb_channel: discord.TextChannel, start_phase: int = 0, ph
             print(f"Phase {i + 1} Interaktion dauerte {carry_over / 60:.1f} min - wird von naechster Phase abgezogen.")
 
         print("Alle Phasen abgeschlossen. Territory Battle Sequenz beendet.")
+        removed = platoons.clear_tb(tb_index)
+        if removed:
+            print(f"{removed} Platoon-Zuweisungen von TB #{tb_index + 1} entfernt.")
         clear_current_run(stats)
 
     except Exception as e:
@@ -838,6 +845,147 @@ def launch_run_sequence(*args, **kwargs) -> asyncio.Task:
     return task
 
 
+# ── Platoon-Zuweisungen: DM zu Phasenbeginn ───────────────────────────────────
+# Unabhängig von run_sequence: eine Schleife prüft jede Minute anhand von
+# stats["current_run"], welche Phase gerade offen ist, und verschickt
+# fällige DMs. Damit funktioniert der Versand auch nach Neustart,
+# Auto-Recovery, /tbreminder_resume und für Einträge, die erst während der
+# laufenden Phase registriert werden -- ohne eigene Timer, die verloren
+# gehen können. Versendet-Status steht in platoon_assignments.json, also
+# keine Doppel-DMs nach einem Neustart.
+
+PLATOON_DISPATCH_INTERVAL = 60  # Sekunden
+
+# Schützt platoon_assignments.json gegen gleichzeitiges Lesen-Ändern-
+# Schreiben von Dispatcher und register/remove.
+_platoon_lock = asyncio.Lock()
+
+
+def _platoon_dm_text(phase: int, entries: list[dict]) -> str:
+    lines = [
+        f"**Territory Battle - Phase {phase} hat begonnen**",
+        "Bitte stationiere in dieser Phase folgende Platoons:",
+    ]
+    for a in sorted(entries, key=lambda a: (a["planet"].lower(), a["unit_name"].lower())):
+        lines.append(f"• **{a['unit_name']}** auf **{a['planet']}**")
+    return "\n".join(lines)
+
+
+async def _resolve_dm_target(guild: discord.Guild | None, discord_id: str | None):
+    if not discord_id or guild is None:
+        return None
+    try:
+        uid = int(discord_id)
+    except ValueError:
+        return None
+    member = guild.get_member(uid)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(uid)
+    except (discord.NotFound, discord.HTTPException):
+        return None
+
+
+async def dispatch_platoon_dms() -> None:
+    async with _platoon_lock:
+        run = load_stats().get("current_run", {})
+        phase = platoons.current_open_phase(run)
+        if phase is None:
+            return
+        tb_index = run.get("tb_index")
+        if tb_index is None:
+            return
+
+        assignments = platoons.load()
+        count_before = len(assignments)
+        assignments = platoons.prune_stale(assignments, tb_index)
+        bound = platoons.bind_unbound(assignments, tb_index)
+        if bound or len(assignments) != count_before:
+            platoons.save(assignments)
+
+        due = [
+            a for a in assignments
+            if a["tb_index"] == tb_index and a["phase"] == phase and not a["sent"]
+        ]
+        if not due:
+            return
+
+        by_player: dict[str, list[dict]] = {}
+        for a in due:
+            by_player.setdefault(a["ally_code"], []).append(a)
+
+        guild = bot.get_guild(GUILD_ID)
+        text_ok: list[str] = []
+        text_failed: list[str] = []
+
+        for ally_code, entries in by_player.items():
+            name = entries[0]["player_name"]
+            discord_id = entries[0].get("discord_id")
+            # Aktuelle Verknüpfung aus dem Roster bevorzugen (falls neu
+            # verknüpft), gespeicherte ID aus der Registrierung als Fallback.
+            try:
+                row = roster_read.get_player(ally_code)
+                if row is not None:
+                    name = row["player_name"] or name
+                    if row["discord_id"]:
+                        discord_id = row["discord_id"]
+            except roster_read.RosterUnavailableError as e:
+                print(f"Platoon-DM: Roster nicht erreichbar ({e}) - nutze gespeicherte Discord-ID.")
+
+            if not discord_id:
+                result = "keine Discord-Verknüpfung"
+            else:
+                target = await _resolve_dm_target(guild, discord_id)
+                _, failed = await send_dms([(ally_code, name, target)], _platoon_dm_text(phase, entries))
+                result = failed[0][2] if failed else "ok"
+
+            for a in entries:
+                a["sent"] = True
+                a["result"] = result
+            # Nach jedem Spieler speichern: ein Absturz mitten im Versand
+            # führt höchstens für den gerade bearbeiteten Spieler zu einer
+            # doppelten DM, nicht für alle bereits angeschriebenen.
+            platoons.save(assignments)
+
+            units = ", ".join(f"{a['unit_name']} ({a['planet']})" for a in entries)
+            if result == "ok":
+                text_ok.append(f"{name}: {units}")
+            else:
+                text_failed.append(f"{name} ({result}): {units}")
+
+        print(f"Phase {phase}: Platoon-DMs an {len(text_ok)} Spieler, {len(text_failed)} nicht erreicht.")
+
+        org_channel = bot.get_channel(ORG_CHANNEL_ID)
+        if org_channel is None:
+            return
+        lines = [f"📨 **Phase {phase} - Platoon-DMs** an {len(text_ok)} Spieler verschickt."]
+        lines += [f"• {t}" for t in sorted(text_ok, key=str.lower)]
+        if text_failed:
+            lines.append(f"⚠️ **Nicht erreicht ({len(text_failed)}) - bitte manuell informieren:**")
+            lines += [f"• {t}" for t in sorted(text_failed, key=str.lower)]
+        try:
+            for chunk in split_message("\n".join(lines)):
+                await org_channel.send(chunk, allowed_mentions=NO_MENTIONS)
+        except discord.HTTPException as e:
+            print(f"Konnte Platoon-Zusammenfassung nicht posten: {e}")
+
+
+@tasks.loop(seconds=PLATOON_DISPATCH_INTERVAL)
+async def platoon_dispatch_loop():
+    # Ausnahmen hier abfangen: eine unbehandelte Exception beendet
+    # tasks.loop dauerhaft.
+    try:
+        await dispatch_platoon_dms()
+    except Exception:
+        print(f"Platoon-Dispatcher fehlgeschlagen:\n{traceback.format_exc()}")
+
+
+@platoon_dispatch_loop.before_loop
+async def _platoon_loop_wait_ready():
+    await bot.wait_until_ready()
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -860,6 +1008,9 @@ async def on_ready():
     # darf nur beim allerersten Verbindungsaufbau laufen, sonst würde ein
     # normaler Reconnect während einer laufenden Sequenz fälschlich einen
     # zweiten run_sequence-Task neben dem bereits laufenden starten.
+    if not platoon_dispatch_loop.is_running():
+        platoon_dispatch_loop.start()
+
     if _startup_recovery_done:
         return
     _startup_recovery_done = True
@@ -1218,6 +1369,8 @@ async def cancel_tb(interaction: discord.Interaction):
                     if player.get("total_tbs", 0) > 0:
                         player["total_tbs"] -= 1
                 stats["total_tbs"] = max(0, stats.get("total_tbs", 1) - 1)
+            if tb_index is not None:
+                platoons.reset_tb(tb_index)
             clear_current_run(stats)
             await interaction.response.send_message(
                 "⛔ TB-Sequenz abgebrochen. Noch keine Daten vorhanden — TB-Zaehler zurueckgesetzt.",
@@ -1290,12 +1443,32 @@ async def tb_status(interaction: discord.Interaction):
     # der vorherigen = vorheriger Trigger + PLAYER_REMINDER_OFFSET.
     phase_start_ts = started_at if phase == 0 else started_at + config.PLAYER_REMINDER_OFFSET
 
+    platoon_line = ""
+    try:
+        pending = [
+            a for a in platoons.load()
+            if a["tb_index"] in (tb_index, None) and not a["sent"]
+        ]
+        open_phase = platoons.current_open_phase(run) or 0
+        pending = [a for a in pending if a["phase"] >= open_phase]
+        upcoming = sorted({a["phase"] for a in pending})
+        if upcoming:
+            next_ts = platoons.phase_open_ts(run, upcoming[0])
+            when = f" (<t:{next_ts}:R>)" if next_ts else ""
+            platoon_line = (
+                f"Platoon-DMs offen:          {len(pending)} Eintraege, "
+                f"naechste zu Beginn von Phase {upcoming[0]}{when}\n"
+            )
+    except Exception as e:
+        print(f"Platoon-Status nicht lesbar: {e}")
+
     await interaction.response.send_message(
         f"**TB #{tb_index + 1} - Phase {phase + 1} laeuft**\n\n"
         f"Phase gestartet:            <t:{phase_start_ts}:F>\n"
         f"Spielerauswahl (rote-org.): <t:{trigger_ts}:F> (<t:{trigger_ts}:R>)\n"
         f"Generische Erinnerung*:     <t:{generic_ts}:F>\n"
-        f"Phase endet:                <t:{phase_end_ts}:F> (<t:{phase_end_ts}:R>)\n\n"
+        f"Phase endet:                <t:{phase_end_ts}:F> (<t:{phase_end_ts}:R>)\n"
+        f"{platoon_line}\n"
         f"-# * nur, wenn bis dahin niemand die Auswahl bestaetigt hat",
         ephemeral=True,
     )
@@ -1978,6 +2151,250 @@ async def units_ping(
     await _run_unit_command(interaction, unit, relic, preselect_all=True)
 
 
+# ── Platoon-Zuweisungen: register / remove / list ─────────────────────────────
+
+async def platoon_player_autocomplete(interaction: discord.Interaction, current: str):
+    """Spieler aus der players-Tabelle. Ist die Einheit schon gewählt, nur
+    deren Besitzer (nach Relic absteigend), sonst alle. Wert = Ally-Code."""
+    unit = getattr(interaction.namespace, "unit", None)
+    try:
+        rows = None
+        if unit:
+            unit_id = roster_read.resolve_unit_id(unit)
+            if unit_id:
+                rows = roster_read.get_owners_of_unit_ignore_relic(unit_id)
+                rows = sorted(rows, key=lambda r: (r["relic_tier"] or 0, r["gear_tier"] or 0), reverse=True)
+        if rows is None:
+            rows = roster_read.get_all_players()
+    except roster_read.RosterUnavailableError as e:
+        print(f"Spieler-Autocomplete fehlgeschlagen: {e}")
+        return []
+
+    choices = []
+    for r in rows:
+        name = r["player_name"] or r["ally_code"]
+        if current.lower() not in name.lower():
+            continue
+        relic = config.relic_tier_to_display(r["relic_tier"]) if "relic_tier" in r.keys() else 0
+        label = f"{name} (R{relic})" if relic else name
+        choices.append(app_commands.Choice(name=label[:100], value=r["ally_code"]))
+        if len(choices) == 25:
+            break
+    return choices
+
+
+async def platoon_entry_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        assignments = platoons.load()
+    except Exception as e:
+        print(f"Platoon-Autocomplete fehlgeschlagen: {e}")
+        return []
+    assignments.sort(key=lambda a: (a["phase"], a["planet"].lower(), a["unit_name"].lower(), a["player_name"].lower()))
+    return [
+        app_commands.Choice(name=platoons.label(a)[:100], value=a["id"])
+        for a in assignments
+        if current.lower() in platoons.label(a).lower()
+    ][:25]
+
+
+async def _send_chunked_ephemeral(interaction: discord.Interaction, text: str) -> None:
+    """Für bereits deferred Interactions: alle Teile als Followup."""
+    for chunk in split_message(text):
+        await interaction.followup.send(chunk, ephemeral=True)
+
+
+@tree.command(
+    name="tbreminder_platoon_register",
+    description="Platoon zuweisen: Spieler bekommt zu Beginn der Phase eine DM",
+)
+@app_commands.describe(
+    phase="Phase (1-6), in der der Platoon gesetzt werden soll",
+    planet="Planet, auf dem der Platoon gesetzt werden soll",
+    unit="Einheit (Charakter oder Schiff)",
+    player="Spieler (nach Wahl der Einheit: nur deren Besitzer)",
+)
+@app_commands.autocomplete(
+    planet=planet_autocomplete, unit=unit_autocomplete, player=platoon_player_autocomplete
+)
+async def platoon_register(
+    interaction: discord.Interaction,
+    phase: app_commands.Range[int, 1, 6],
+    planet: str,
+    unit: str,
+    player: str,
+):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoetigst Administrator-Rechte oder Manager-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    # Defer vor allem anderen: der Lock unten kann warten, solange der
+    # Dispatcher gerade DMs verschickt (3-s-Antwortfrist von Discord).
+    await interaction.response.defer(ephemeral=True)
+
+    planet = planet.strip()
+    if not planet:
+        await interaction.followup.send("Planet darf nicht leer sein.", ephemeral=True)
+        return
+
+    try:
+        unit_id = roster_read.resolve_unit_id(unit)
+        row = roster_read.get_player(player) or roster_read.find_player_by_name(player)
+        owners = roster_read.get_owners_of_unit_ignore_relic(unit_id) if unit_id else []
+    except roster_read.RosterUnavailableError as e:
+        await interaction.followup.send(f"Rosterdaten nicht erreichbar: {e}", ephemeral=True)
+        return
+
+    if unit_id is None:
+        await interaction.followup.send(
+            f"'{unit}' konnte nicht aufgeloest werden -- besitzt sie laut letztem "
+            f"Roster-Refresh mindestens ein Gildenmitglied?",
+            ephemeral=True,
+        )
+        return
+    if row is None:
+        await interaction.followup.send(
+            f"Spieler '{player}' nicht gefunden. Bitte einen Vorschlag aus der Liste waehlen.",
+            ephemeral=True,
+        )
+        return
+
+    ally_code = row["ally_code"]
+    player_name = row["player_name"] or ally_code
+    warnings: list[str] = []
+
+    if not any(o["ally_code"] == ally_code for o in owners):
+        warnings.append(f"⚠️ Laut Roster besitzt {player_name} **{unit}** nicht.")
+    if not row["discord_id"]:
+        warnings.append(f"⚠️ {player_name} hat keine Discord-Verknuepfung -- die DM wird nicht zustellbar sein.")
+
+    try:
+        known_planets = requirements.get_planets()
+    except Exception:
+        known_planets = []
+    match = next((p for p in known_planets if p.lower() == planet.lower()), None)
+    if match:
+        planet = match
+    elif known_planets:
+        warnings.append(f"⚠️ Planet '{planet}' steht nicht in der Anforderungsliste.")
+
+    async with _platoon_lock:
+        run = load_stats().get("current_run", {})
+        open_phase = platoons.current_open_phase(run)
+        tb_index = None
+        if open_phase is not None:
+            if phase < open_phase:
+                await interaction.followup.send(
+                    f"Phase {phase} ist im laufenden TB schon vorbei (aktuell Phase {open_phase}). "
+                    f"Eintraege fuer den naechsten TB sind erst nach Ende dieses TBs moeglich.",
+                    ephemeral=True,
+                )
+                return
+            tb_index = run.get("tb_index")
+
+        assignments = platoons.load()
+        if platoons.find_duplicate(assignments, phase, planet, unit_id, ally_code):
+            await interaction.followup.send(
+                f"Diesen Eintrag gibt es schon: Phase {phase} · {planet} · {unit} · {player_name}.",
+                ephemeral=True,
+            )
+            return
+
+        entry = platoons.new_assignment(
+            phase=phase, planet=planet, unit_id=unit_id, unit_name=unit,
+            ally_code=ally_code, player_name=player_name, discord_id=row["discord_id"],
+            created_by=interaction.user.display_name, tb_index=tb_index,
+        )
+        assignments.append(entry)
+        platoons.save(assignments)
+
+    if tb_index is None:
+        when = f"DM zu Beginn von Phase {phase} des naechsten TBs."
+    elif phase == open_phase:
+        when = f"Phase {phase} laeuft bereits -- die DM geht jetzt raus."
+    else:
+        ts = platoons.phase_open_ts(run, phase)
+        when = f"DM zu Beginn von Phase {phase}" + (f": <t:{ts}:F> (<t:{ts}:R>)." if ts else ".")
+
+    msg = [f"✅ Eingetragen: **Phase {phase}** · {planet} · **{unit}** → {player_name}", when] + warnings
+    await interaction.followup.send("\n".join(msg), ephemeral=True)
+    print(f"Platoon-Zuweisung von {interaction.user.display_name}: {platoons.label(entry)}")
+
+    if tb_index is not None and phase == open_phase:
+        await dispatch_platoon_dms()
+
+
+@tree.command(name="tbreminder_platoon_remove", description="Platoon-Zuweisung entfernen")
+@app_commands.describe(entry="Zuweisung (Phase · Planet · Einheit · Spieler)")
+@app_commands.autocomplete(entry=platoon_entry_autocomplete)
+async def platoon_remove(interaction: discord.Interaction, entry: str):
+    if not is_authorized(interaction):
+        await interaction.response.send_message(
+            "Du benoetigst Administrator-Rechte oder Manager-Status fuer diesen Befehl.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    async with _platoon_lock:
+        assignments = platoons.load()
+        target = next((a for a in assignments if a["id"] == entry), None)
+        if target is None:
+            await interaction.followup.send(
+                "Eintrag nicht gefunden. Bitte einen Vorschlag aus der Liste waehlen.",
+                ephemeral=True,
+            )
+            return
+        assignments.remove(target)
+        platoons.save(assignments)
+
+    note = "\n-# Die DM wurde bereits verschickt." if target["sent"] else ""
+    await interaction.followup.send(f"🗑️ Entfernt: {platoons.label(target)}{note}", ephemeral=True)
+    print(f"Platoon-Zuweisung entfernt von {interaction.user.display_name}: {platoons.label(target)}")
+
+
+@tree.command(name="tbreminder_platoon_list", description="Zeigt alle Platoon-Zuweisungen nach Phase")
+async def platoon_list(interaction: discord.Interaction):
+    if not can_use_org_commands(interaction):
+        await deny_org_only(interaction)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    assignments = platoons.load()
+    if not assignments:
+        await interaction.followup.send("Keine Platoon-Zuweisungen vorhanden.", ephemeral=True)
+        return
+
+    run = load_stats().get("current_run", {})
+    open_phase = platoons.current_open_phase(run)
+    lines = [f"**Platoon-Zuweisungen** ({len(assignments)})"]
+    if any(a["tb_index"] is None for a in assignments):
+        lines.append("-# (naechster TB) = gilt fuer den naechsten TB-Start")
+    for phase in range(1, config.PHASE_COUNT + 1):
+        entries = sorted(
+            (a for a in assignments if a["phase"] == phase),
+            key=lambda a: (a["planet"].lower(), a["unit_name"].lower(), a["player_name"].lower()),
+        )
+        if not entries:
+            continue
+        lines.append(f"\n**Phase {phase}**")
+        for a in entries:
+            if not a["sent"] and a["tb_index"] is not None and open_phase and a["phase"] < open_phase:
+                status = "⏭️ (Phase verpasst, keine DM)"
+            elif not a["sent"]:
+                status = "⏳"
+            elif a["result"] == "ok":
+                status = "✅"
+            else:
+                status = f"⚠️ ({a['result']})"
+            suffix = " (naechster TB)" if a["tb_index"] is None else ""
+            lines.append(f"{status} {a['planet']} · {a['unit_name']} → {a['player_name']}{suffix}")
+
+    await _send_chunked_ephemeral(interaction, "\n".join(lines))
+
+
 @tree.command(name="tbreminder_help", description="Zeigt alle verfuegbaren Bot-Befehle und ihre Verwendung")
 async def help_command(interaction: discord.Interaction):
     help_text = (
@@ -2041,13 +2458,29 @@ async def help_command(interaction: discord.Interaction):
         "**`/tbreminder_units_ping unit relic`**\n"
         "Wie `/tbreminder_units_check`, aber alle Besitzer sind vorausgewaehlt.\n\n"
 
+        "### 📌 Platoon-Zuweisungen\n"
+        "**`/tbreminder_platoon_register phase planet unit player`** *(Admin/Manager)*\n"
+        "Weist einem Spieler eine Einheit fuer einen Planeten in einer Phase zu. "
+        "Zu Beginn dieser Phase bekommt der Spieler eine DM mit allen seinen "
+        "Zuweisungen fuer die Phase; rote-organisation erhaelt eine Zusammenfassung. "
+        "Ohne laufenden TB gilt der Eintrag fuer den naechsten TB.\n\n"
+
+        "**`/tbreminder_platoon_remove entry`** *(Admin/Manager)*\n"
+        "Entfernt eine Zuweisung.\n\n"
+
+        "**`/tbreminder_platoon_list`**\n"
+        "Zeigt alle Zuweisungen nach Phase (⏳ offen, ✅ zugestellt, ⚠️ nicht erreicht, "
+        "⏭️ Phase verpasst). "
+        "Nach Phase 6 werden die Zuweisungen des TBs geloescht.\n\n"
+
         "### ℹ️ Sonstiges\n"
         "**`/tbreminder_help`**\n"
         "Zeigt diese Uebersicht.\n\n"
 
         "-# TB-Ablaufsteuerung (start, timer, resume, status, results, cancel, "
         "requirements_upload) erfordert Administrator-Rechte oder Manager-Status. "
-        "Platoon-/Unit-Befehle: alle in rote-organisation, Admins/Manager ueberall."
+        "platoon_register/-remove: Admin/Manager. Weitere Platoon-/Unit-Befehle: "
+        "alle in rote-organisation, Admins/Manager ueberall."
     )
     # Discord-Limit 2000 Zeichen: abschnittsweise (### ...) zu Nachrichten packen,
     # damit kein Befehl von seiner Beschreibung getrennt wird. Ein einzelner zu

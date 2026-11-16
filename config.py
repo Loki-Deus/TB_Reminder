@@ -36,6 +36,7 @@ DATA_DIR = os.getenv("DATA_DIR", ".")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 REQUIREMENTS_DIR = os.path.join(DATA_DIR, "requirements")
 REQUIREMENTS_FILE = os.path.join(REQUIREMENTS_DIR, "rote.json")
+PLATOON_FILE = os.path.join(DATA_DIR, "platoon_assignments.json")
 
 # Read-only Mount von tw-counters counters.db -- siehe docker-compose.yml.
 # Fehlt dieser Pfad (z.B. lokaler Testlauf ohne den Stack), fallen die

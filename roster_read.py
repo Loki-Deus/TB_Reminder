@@ -175,3 +175,33 @@ def get_owners_of_unit_ignore_relic(unit_id: str) -> list[sqlite3.Row]:
             """,
             (unit_id,),
         ).fetchall()
+
+
+def get_all_players() -> list[sqlite3.Row]:
+    """Alle Gildenmitglieder aus players -- Quelle für die Spielerauswahl
+    von /tbreminder_platoon_register, wenn (noch) keine Einheit gewählt ist."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ally_code, player_name, discord_id FROM players "
+            "ORDER BY player_name COLLATE NOCASE"
+        ).fetchall()
+
+
+def get_player(ally_code: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ally_code, player_name, discord_id FROM players WHERE ally_code = ?",
+            (ally_code,),
+        ).fetchone()
+
+
+def find_player_by_name(name: str) -> sqlite3.Row | None:
+    """Fallback, falls jemand den Namen tippt statt einen Autocomplete-
+    Vorschlag (Wert = Ally-Code) zu wählen. Nur eindeutige Treffer."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT ally_code, player_name, discord_id FROM players "
+            "WHERE player_name = ? COLLATE NOCASE",
+            (name,),
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None

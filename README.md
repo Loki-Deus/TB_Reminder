@@ -17,6 +17,7 @@ T = Phasenende (Phasen dauern 24 h). Die Offsets stehen in `config.py` (`PLAYER_
 | ↳ keine Bestätigung bis T − 1 h | TB-Kanal | dieselbe generische Nachricht |
 | direkt danach | `rote-organisation` | „Wer hat NICHT stationiert?"-Auswahl, Frist bis zum nächsten Trigger (nach Phase 6: 22 h). Nach Bestätigung enthält sie nur die zuvor zur Erinnerung ausgewählten Spieler, nach „Überspringen"/Timeout alle. |
 | nach Phase 6 | `rote-organisation` | TB-Abschlussbericht (Erinnerungen + Fehlende) |
+| Beginn jeder Phase (Phase 1 = TB-Start, danach jeweils das Ende der Vorphase) | DMs + `rote-organisation` | Platoon-Zuweisungen dieser Phase: eine DM pro Spieler mit allen seinen Einheiten/Planeten, Zusammenfassung inkl. nicht Erreichter in `rote-organisation` (siehe [Platoon-Zuweisungen](#platoon-zuweisungen)) |
 
 Die Frist der Auswahl (3 h) ist hart: ein Klick kurz vor Fristende verlängert sie nicht.
 
@@ -33,6 +34,14 @@ Die Frist der Auswahl (3 h) ist hart: ein Klick kurz vor Fristende verlängert s
 | `/tbreminder_cancel` | Bricht Timer oder aktive Sequenz ab |
 | `/tbreminder_results` | Postet den Abschlussbericht des letzten TBs im aktuellen Kanal |
 | `/tbreminder_requirements_upload file` | Lädt die Platoon-Anforderungsliste (CSV: `planet, unit_name, required_count, required_relic`) hoch; ersetzt die bestehende mit Bestätigung und Backup |
+
+**Platoon-Zuweisungen** — `register`/`remove`: Administrator oder `MANAGER_IDS`; `list`: wie die Platoon-Befehle unten:
+
+| Befehl | Beschreibung |
+|---|---|
+| `/tbreminder_platoon_register phase planet unit player` | Weist einem Spieler eine Einheit für einen Planeten in Phase 1–6 zu. Spieler-Autocomplete aus der `players`-Tabelle; nach Wahl der Einheit nur deren Besitzer (nach Relic absteigend). |
+| `/tbreminder_platoon_remove entry` | Entfernt eine Zuweisung (Autocomplete: `P3 · Planet · Einheit · Spieler`) |
+| `/tbreminder_platoon_list` | Alle Zuweisungen nach Phase: ⏳ offen, ✅ zugestellt, ⚠️ nicht erreicht, ⏭️ Phase verpasst |
 
 **Platoons** — für jeden nutzbar, der den Befehl in `rote-organisation` ausführt (Admins/Manager auch in jedem anderen Kanal):
 
@@ -99,6 +108,17 @@ Der Bot läuft als Service `tb-reminder` im gemeinsamen Stack (`docker-compose.y
 **Zeitpunkt des Updates:** zwischen zwei TBs, nicht mitten in einer laufenden Sequenz. Views sind im Arbeitsspeicher; ein Neustart während einer offenen Auswahl verwirft sie, und die Recovery setzt erst bei der nächsten Phase wieder an.
 
 Manuell: `pip install -r requirements.txt && python bot.py`
+
+## Platoon-Zuweisungen
+
+Gespeichert in `DATA_DIR/platoon_assignments.json` (atomar geschrieben, übersteht Neustarts). Ein Dispatcher prüft jede Minute anhand von `current_run` in `stats.json`, welche Phase offen ist, und verschickt fällige DMs. Er hängt nicht an den Sleeps von `run_sequence`, funktioniert also auch nach Auto-Recovery und `/tbreminder_resume`. Der Versandstatus steht pro Eintrag in der Datei, daher keine doppelten DMs nach einem Neustart.
+
+- **Phasenbeginn:** Phase 1 = TB-Start, Phase N = Erinnerungsauswahl von Phase N−1 + `PLAYER_REMINDER_OFFSET`.
+- **Ohne laufenden TB** eingetragen → gilt für den nächsten TB-Start.
+- **Während eines TBs** eingetragen → gilt für diesen TB; für die gerade offene Phase geht die DM sofort raus, für bereits vergangene Phasen wird der Eintrag abgelehnt.
+- **Discord-ID** wird beim Versand frisch aus `players` gelesen, die bei der Registrierung gespeicherte ist nur Fallback. Ohne Verknüpfung oder bei deaktivierten DMs: Eintrag in der Zusammenfassung unter „Nicht erreicht", kein erneuter Versuch.
+- **Aufräumen:** Nach Phase 6 werden alle Zuweisungen des TBs gelöscht. `/tbreminder_cancel` vor Phase 1 setzt sie zurück (gehen beim Neustart erneut raus); Zuweisungen eines abgebrochenen, nie fortgesetzten TBs werden beim nächsten TB verworfen.
+- Platoon-DMs zählen nicht in die Statistik.
 
 ## Statistik
 
